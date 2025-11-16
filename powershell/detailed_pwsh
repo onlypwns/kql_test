@@ -1,0 +1,45 @@
+let deviceName = "workstation1";
+let timeRange = ago(14d);
+// PowerShell Transcription and Operational Logs
+DeviceEvents
+| where Timestamp > timeRange
+| where DeviceName =~ deviceName
+| where ActionType in (
+    "PowerShellCommand",
+    "ScriptContent", 
+    "ProcessCreated",
+    "TranscriptionLogged",
+    "OperationalEventLogged"
+)
+| where InitiatingProcessFileName in~ ("powershell.exe", "pwsh.exe")
+    or FileName in~ ("powershell.exe", "pwsh.exe")
+| extend Fields = parse_json(AdditionalFields)
+| extend 
+    // Try multiple field paths for content extraction
+    Content1 = tostring(Fields.ScriptBlockText),
+    Content2 = tostring(Fields.Payload),
+    Content3 = tostring(Fields.Command),
+    Content4 = tostring(Fields.ScriptContent),
+    Content5 = tostring(Fields.TranscriptContent),
+    HostApplication = tostring(Fields.HostApplication),
+    ScriptName = tostring(Fields.ScriptName),
+    Path = tostring(Fields.Path)
+| extend 
+    CombinedContent = coalesce(Content1, Content2, Content3, Content4, Content5, ""),
+    PossibleFile = coalesce(ScriptName, Path, 
+        extract(@"([^\\\/]+\.ps1)", 1, ProcessCommandLine),
+        extract(@"([^\\\/]+\.ps1)", 1, InitiatingProcessCommandLine))
+| where CombinedContent contains "malicious"
+    or PossibleFile contains "malicious"
+    or ProcessCommandLine contains "malicious.ps1"
+| project 
+    Timestamp,
+    EventSource = ActionType,
+    ScriptFile = PossibleFile,
+    RecoveredContent = CombinedContent,
+    ContentLength = strlen(CombinedContent),
+    HostApplication,
+    ProcessCommandLine,
+    InitiatingProcessCommandLine,
+    AllFields = Fields
+| sort by Timestamp asc
