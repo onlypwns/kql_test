@@ -1,0 +1,18 @@
+let deviceName = "workstation1";
+let timeRange = ago(1h);
+
+// Look for script blocks that might show variable assignment AND usage
+DeviceEvents
+| where Timestamp > timeRange
+| where DeviceName =~ deviceName
+| where ActionType == "PowerShellCommand"
+| extend ScriptContent = tostring(parse_json(AdditionalFields).ScriptBlockText)
+| where ScriptContent contains "$path" or ScriptContent matches regex @"\$\w+\s*=.*"
+| extend 
+    // Try to find variable assignments
+    VariableAssignment = extract(@'(\$path\s*=\s*["\']?[^"\'\r\n]+)', 1, ScriptContent),
+    // Try to find the unblock command
+    UnblockCommand = extract(@'(Unblock-File[^;\r\n]+)', 1, ScriptContent)
+| where isnotempty(VariableAssignment) or isnotempty(UnblockCommand)
+| project Timestamp, VariableAssignment, UnblockCommand, ScriptContent
+| sort by Timestamp asc
