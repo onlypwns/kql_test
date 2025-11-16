@@ -1,0 +1,121 @@
+let deviceName = "workstation1";
+let fileName = "malicious.ps1";
+let timeRange = ago(7d);  // Extend if needed for deleted files
+// First, let's try to find any trace of the file including deletion events
+let fileTrace = 
+DeviceFileEvents
+| where Timestamp > timeRange
+| where DeviceName =~ deviceName
+| where FileName =~ fileName or FolderPath contains fileName
+| summarize 
+    FirstSeen = min(Timestamp),
+    LastSeen = max(Timestamp),
+    FileActions = make_set(ActionType),
+    FilePaths = make_set(FolderPath),
+    FileHashes = make_set(SHA256)
+by DeviceName, FileName;
+// Union all possible sources for PowerShell execution and content
+union isfuzzy=true
+// 1. PowerShell Script Block Logging - THIS MIGHT CONTAIN THE ACTUAL SCRIPT CONTENTS
+(DeviceEvents
+| where Timestamp > timeRange
+| where DeviceName =~ deviceName
+| where ActionType == "PowerShellCommand" or ActionType == "ScriptContent"
+| where InitiatingProcessFileName =~ "powershell.exe" or InitiatingProcessFileName =~ "pwsh.exe"
+| extend ScriptContent = parse_json(AdditionalFields)
+| where ProcessCommandLine contains fileName 
+    or tostring(ScriptContent) contains fileName
+    or tostring(ScriptContent) contains "malicious"  // In case content contains identifiers
+| extend 
+    EventType = "PowerShellScriptBlock",
+    PossibleScriptContent = tostring(ScriptContent.Command),
+    ScriptBlockText = tostring(ScriptContent.ScriptBlockText),
+    ScriptBlockId = tostring(ScriptContent.ScriptBlockId)
+| project Timestamp, DeviceName, EventType, ActionType, 
+    FileName = coalesce(FileName, InitiatingProcessFileName),
+    ProcessCommandLine, InitiatingProcessCommandLine,
+    PossibleScriptContent, ScriptBlockText, ScriptBlockId, AdditionalFields
+),
+// 2. AMSI (Anti-Malware Scan Interface) Events - May contain script content
+(DeviceEvents
+| where Timestamp > timeRange
+| where DeviceName =~ deviceName
+| where ActionType in ("AmsiScriptContent", "AntiMalwareScanContent", "BehaviorDetected")
+| extend ParsedFields = parse_json(AdditionalFields)
+| where ProcessCommandLine contains fileName 
+    or InitiatingProcessCommandLine contains fileName
+    or tostring(ParsedFields) contains fileName
+| extend 
+    EventType = "AMSIEvent",
+    ScriptContent = tostring(ParsedFields.ScriptContent),
+    ThreatName = tostring(ParsedFields.ThreatName)
+| project Timestamp, DeviceName, EventType, ActionType,
+    FileName = coalesce(FileName, InitiatingProcessFileName),
+    ProcessCommandLine, InitiatingProcessCommandLine,
+    ScriptContent, ThreatName, AdditionalFields
+),
+// 3. Process Events - Direct execution traces
+(DeviceProcessEvents
+| where Timestamp > timeRange
+| where DeviceName =~ deviceName
+| where ProcessCommandLine contains fileName
+    or ProcessCommandLine contains "malicious.ps1"
+    or (FileName in~ ("powershell.exe", "pwsh.exe") and ProcessCommandLine contains "malicious")
+    or ProcessCommandLine matches regex @"(?i)powershell.*-enc.*"  // Encoded commands
+    or ProcessCommandLine matches regex @"(?i)powershell.*-e\s+"    // Shortened encoded
+| extend 
+    EventType = "ProcessExecution",
+    DecodedCommand = iff(
+        ProcessCommandLine matches regex @"(?i)-enc(oded)?\s+([A-Za-z0-9+/=]+)",
+        base64_decode_tostring(extract(@"(?i)-enc(?:oded)?\s+([A-Za-z0-9+/=]+)", 1, ProcessCommandLine)),
+        "")
+| project Timestamp, DeviceName, EventType, ActionType = "ProcessCreated",
+    FileName, FolderPath, ProcessId, InitiatingProcessId,
+    ProcessCommandLine, InitiatingProcessCommandLine, 
+    DecodedCommand, SHA256
+),
+// 4. File Events - Including deletion
+(DeviceFileEvents
+| where Timestamp > timeRange
+| where DeviceName =~ deviceName
+| where FileName =~ fileName or FolderPath contains fileName
+| extend 
+    EventType = case(
+        ActionType == "FileDeleted", "FileDeletion",
+        ActionType == "FileModified", "FileModification", 
+        ActionType == "FileCreated", "FileCreation",
+        "FileOperation"),
+    WasDeleted = iff(ActionType == "FileDeleted", true, false)
+| project Timestamp, DeviceName, EventType, ActionType,
+    FileName, FolderPath, InitiatingProcessFileName,
+    InitiatingProcessCommandLine, SHA256, WasDeleted, FileSize
+),
+// 5. Registry Events - PowerShell persistence mechanisms
+(DeviceRegistryEvents
+| where Timestamp > timeRange
+| where DeviceName =~ deviceName
+| where InitiatingProcessFileName in~ ("powershell.exe", "pwsh.exe")
+    or RegistryValueData contains fileName
+    or RegistryValueData contains "powershell" and RegistryValueData contains "malicious"
+| extend EventType = "RegistryPersistence"
+| project Timestamp, DeviceName, EventType, ActionType,
+    FileName = InitiatingProcessFileName,
+    RegistryKey, RegistryValueName, RegistryValueData,
+    InitiatingProcessCommandLine
+),
+// 6. WMI Events - PowerShell via WMI
+(DeviceEvents
+| where Timestamp > timeRange
+| where DeviceName =~ deviceName
+| where ActionType in ("WmiBindEventFilterToConsumer", "WmiConsumerCreated", "WmiFilterCreated")
+| extend ParsedFields = parse_json(AdditionalFields)
+| where tostring(ParsedFields) contains "powershell" and tostring(ParsedFields) contains fileName
+| extend 
+    EventType = "WMIExecution",
+    WMICommand = tostring(ParsedFields.CommandLine)
+| project Timestamp, DeviceName, EventType, ActionType,
+    FileName = InitiatingProcessFileName,
+    WMICommand, AdditionalFields
+)
+| sort by Timestamp asc
+| extend TimeSinceLastEvent = datetime_diff('second', Timestamp, prev(Timestamp))
