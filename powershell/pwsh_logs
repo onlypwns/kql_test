@@ -1,0 +1,119 @@
+let deviceName = "workstation1";
+let fileName = "malicious.ps1";
+let timeRange = ago(14d);  // Extended for deleted files
+// Query specifically designed to recover PowerShell script contents
+union isfuzzy=true
+// Method 1: Script Block Logging (4104 events)
+(DeviceEvents
+| where Timestamp > timeRange
+| where DeviceName =~ deviceName
+| where ActionType == "PowerShellCommand"
+| extend 
+    Fields = parse_json(AdditionalFields),
+    EventData = parse_json(tostring(parse_json(AdditionalFields).EventData))
+| extend 
+    ScriptBlockText = coalesce(
+        tostring(Fields.ScriptBlockText),
+        tostring(Fields.Command),
+        tostring(EventData.ScriptBlockText),
+        tostring(EventData.Payload)
+    ),
+    ScriptBlockId = tostring(Fields.ScriptBlockId),
+    MessageNumber = toint(Fields.MessageNumber),
+    MessageTotal = toint(Fields.MessageTotal)
+| where isnotempty(ScriptBlockText)
+| where ScriptBlockText contains "malicious" 
+    or ProcessCommandLine contains fileName
+    or ScriptBlockText matches regex @"(?i)\.ps1"
+| project 
+    Timestamp,
+    RecoveryMethod = "ScriptBlockLogging",
+    ScriptContent = ScriptBlockText,
+    ScriptBlockId,
+    MessagePart = strcat(MessageNumber, "/", MessageTotal),
+    ProcessCommandLine,
+    InitiatingProcessCommandLine
+),
+// Method 2: Command Line Arguments
+(DeviceProcessEvents
+| where Timestamp > timeRange
+| where DeviceName =~ deviceName
+| where FileName in~ ("powershell.exe", "pwsh.exe")
+| where ProcessCommandLine contains fileName or ProcessCommandLine contains "malicious"
+| extend 
+    // Try to extract inline script content
+    InlineScript = extract(@"-Command\s+\"([^\"]+)\"", 1, ProcessCommandLine),
+    FileParam = extract(@"-File\s+\"?([^\"]+\.ps1)", 1, ProcessCommandLine),
+    EncodedCommand = extract(@"-E(?:nc(?:oded)?)?(?:Command)?\s+([A-Za-z0-9+/=]+)", 1, ProcessCommandLine)
+| extend 
+    DecodedScript = iff(
+        isnotempty(EncodedCommand),
+        base64_decode_tostring(EncodedCommand),
+        ""
+    )
+| where isnotempty(InlineScript) or isnotempty(DecodedScript) or FileParam contains fileName
+| project 
+    Timestamp,
+    RecoveryMethod = "CommandLine",
+    ScriptContent = coalesce(DecodedScript, InlineScript, "File execution - no inline content"),
+    ExecutedFile = FileParam,
+    ProcessCommandLine,
+    ProcessId,
+    InitiatingProcessId
+),
+// Method 3: AMSI Content Scanning
+(DeviceEvents
+| where Timestamp > timeRange
+| where DeviceName =~ deviceName
+| where ActionType contains "Amsi" or ActionType == "AntiMalwareScanContent"
+| extend Fields = parse_json(AdditionalFields)
+| extend 
+    ScannedContent = tostring(Fields.ScriptContent),
+    ContentName = tostring(Fields.ContentName),
+    ScanResult = tostring(Fields.ScanResult)
+| where ContentName contains fileName 
+    or ScannedContent contains "malicious"
+    or ProcessCommandLine contains ".ps1"
+| project 
+    Timestamp,
+    RecoveryMethod = "AMSI",
+    ScriptContent = ScannedContent,
+    ContentName,
+    ScanResult,
+    ProcessCommandLine
+),
+// Method 4: File Content from Cache/USN Journal
+(DeviceFileEvents
+| where Timestamp > timeRange
+| where DeviceName =~ deviceName
+| where FileName =~ fileName
+| join kind=leftouter (
+    DeviceEvents
+    | where Timestamp > timeRange
+    | where ActionType == "FileContentRead" or ActionType == "UsnJournalEventLogged"
+    | extend Fields = parse_json(AdditionalFields)
+) on DeviceName, $left.SHA256 == $right.SHA256
+| project 
+    Timestamp,
+    RecoveryMethod = "FileSystem",
+    ActionType,
+    FileName,
+    FolderPath,
+    SHA256,
+    FileSize,
+    WasDeleted = iff(ActionType == "FileDeleted", true, false),
+    DeletedTime = iff(ActionType == "FileDeleted", Timestamp, datetime(null))
+)
+| sort by Timestamp asc
+// Combine script blocks if they were split
+| summarize 
+    ScriptParts = make_list(ScriptContent),
+    AllTimestamps = make_list(Timestamp),
+    Methods = make_set(RecoveryMethod),
+    FirstSeen = min(Timestamp),
+    LastSeen = max(Timestamp),
+    CommandLines = make_set(ProcessCommandLine)
+by ScriptBlockId, RecoveryMethod
+| extend 
+    ReconstructedScript = strcat_array(ScriptParts, "\n"),
+    RecoverySuccess = iff(strlen(strcat_array(ScriptParts, "")) > 10, "Likely", "Partial")
