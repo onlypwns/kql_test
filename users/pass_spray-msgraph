@@ -1,0 +1,9 @@
+ MicrosoftGraphActivityLogs
+ | where TimeGenerated > ago(30d)
+ | join AADRiskyUsers on $left.UserId == $right.Id
+ | extend resourcePath = replace_string(replace_string(replace_regex(tostring (parse_url(RequestUri).Path),@'(\/)+','/'),'v1.0/',''),'beta/','')
+ | where resourcePath !contains "photo" 
+ | where resourcePath != "/organization"
+ | where resourcePath != "/directoryRoles"
+ | where ResponseStatusCode == 200
+ | summarize RequestCount=dcount(RequestId) by UserPrincipalName, resourcePath, ResponseStatusCode
