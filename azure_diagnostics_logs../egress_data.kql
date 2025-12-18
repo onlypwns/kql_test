@@ -1,0 +1,5 @@
+AzureMetrics
+| where ResourceProvider == "MICROSOFT.STORAGE"
+| where MetricName == "Egress"
+| sort by TimeGenerated
+| project TimeGenerated, Resource, Total
