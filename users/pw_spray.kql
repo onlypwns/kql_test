@@ -1,0 +1,5 @@
+SigninLogs
+| where ResultType != 0
+| where TimeGenerated >= ago(24h)
+| summarize FailedLoginCount = count() by ResourceDisplayName, UserPrincipalName, IPAddress, TimeGenerated
+| sort by UserPrincipalName desc nulls last
