@@ -1,0 +1,4 @@
+SigninLogs
+| where AuthenticationProtocol == "deviceCode"
+| where ResourceDisplayName == "Microsoft Graph"
+| project TimeGenerated, UserPrincipalName, AuthenticationProtocol, ResourceDisplayName, IPAddress, Location, ResultDescription
