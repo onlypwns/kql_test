@@ -1,0 +1,8 @@
+MicrosoftGraphActivityLogs
+| where TimeGenerated >= ago(3d)
+| where UserAgent contains "azurehound" 
+| extend NormalizedRequestUri = replace_regex(RequestUri, @'/[0-9a-fA-F]{8}\b-[0-9a-fA-F]{4}\b-[0-9a-fA-F]{4}\b-[0-9a-fA-F]{4}\b-[0-9a-fA-F]{12}/',@'/APPID/')
+| extend NormalizedRequestUri = replace_regex(NormalizedRequestUri, @'/roleAssignments\?.*$', @'')
+| extend NormalizedRequestUri = replace_regex(NormalizedRequestUri, @'\?.*$', @'')
+| summarize count() by NormalizedRequestUri
+| sort by count_ desc
