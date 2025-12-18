@@ -1,0 +1,4 @@
+MicrosoftGraphActivityLogs
+| where UserAgent contains "azurehound"
+| summarize ObjectIds = make_set(UserId), UserAgents = make_set(UserAgent) by IPAddress
+| project IPAddress, ObjectIds, UserAgents
