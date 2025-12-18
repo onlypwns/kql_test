@@ -1,0 +1,4 @@
+AzureDiagnostics
+| where ResourceType == "SERVERS/DATABASES"
+| where ResourceProvider == "MICROSOFT.SQL"
+| where Category == "Errors"
