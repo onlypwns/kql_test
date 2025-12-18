@@ -1,0 +1,5 @@
+MicrosoftGraphActivityLogs
+| where SignInActivityId contains "8cVAJubu7Ea-bUsbdgsgAA"
+| extend NormalizedRequestUri = replace_regex(RequestUri, @'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}','<UUID>') 
+| extend NormalizedRequestUri = replace_regex(NormalizedRequestUri, @'\?.*$', '')
+| summarize GraphEndpointsCalled = make_set(NormalizedRequestUri), IPAddresses = make_set(IPAddress), UserAgents = make_set(UserAgent)
