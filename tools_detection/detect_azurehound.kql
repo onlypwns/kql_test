@@ -1,0 +1,10 @@
+MicrosoftGraphActivityLogs
+| where ingestion_time() > ago(3d)
+| extend ObjectId = iff(isempty(UserId), ServicePrincipalId, UserId), ObjectType = iff(isempty(UserId), "ServicePrincipalId", "UserId"), UniqueTokenIdentifier = SignInActivityId
+| where RequestUri !has "microsoft.graph.delta"
+| extend NormalizedRequestUri = replace_regex(RequestUri, @'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}', '<UUID>') 
+| extend NormalizedRequestUri = replace_regex(NormalizedRequestUri, @'\?.*$', '') 
+| summarize GraphEndpointsCalled = make_set(NormalizedRequestUri), IPAddresses = make_set(IPAddress), UserAgents = make_set(UserAgent) by ObjectId, ObjectType, UniqueTokenIdentifier
+| project ObjectId, ObjectType, UniqueTokenIdentifier, IPAddresses, UserAgents, MatchingQueries = set_intersect(AzureHoundGraphQueries, GraphEndpointsCalled)
+| extend ConfidenceScore = round(todouble(array_length(MatchingQueries)) todouble(array_length(AzureHoundGraphQueries)), 1)
+| where ConfidenceScore > 0.7
