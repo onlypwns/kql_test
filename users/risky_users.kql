@@ -1,0 +1,5 @@
+AADRiskyUsers
+| where RiskDetail != "hidden"
+| where RiskDetail != "userPerformedSecuredPasswordReset"
+| where RiskLevel == "high"
+| project UserPrincipalName, RiskLevel, RiskState
