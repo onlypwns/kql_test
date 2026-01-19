@@ -1,0 +1,270 @@
+// ============================================================================
+// QUERY: PowerShell Script Content Recovery from Multiple Sources
+// ============================================================================
+//
+// PURPOSE:
+//   Recovers PowerShell script content using multiple telemetry sources and
+//   field extraction paths. Designed to reconstruct scripts even when files
+//   have been deleted, combining script block logging, transcription logs,
+//   and operational events.
+//
+// MITRE ATT&CK:
+//   - T1059.001: Command and Scripting Interpreter - PowerShell
+//   - T1070.004: Indicator Removal on Host - File Deletion
+//   - T1027: Obfuscated Files or Information
+//   - T1204.002: User Execution - Malicious File
+//
+// THREAT CONTEXT:
+//   Adversaries frequently use PowerShell for post-exploitation and delete
+//   scripts to evade detection. This query attempts to recover script content
+//   from multiple logging sources including script block logging (Event ID 4104),
+//   transcription logs, and operational logs, trying various field paths for
+//   maximum coverage.
+//
+// DATA SOURCES:
+//   - DeviceEvents (PowerShell logging, transcription, operational events)
+//   - DeviceProcessEvents (Command line arguments, inline scripts, encoded commands)
+//   - Requires: Microsoft Defender for Endpoint with PowerShell telemetry
+//
+// CONFIGURATION:
+//   IMPORTANT: Customize the parameters below for your investigation
+//
+// PERFORMANCE NOTES:
+//   - Estimated execution time: 30-60 seconds for 14 days of data
+//   - Uses union isfuzzy=true for schema flexibility
+//   - Multiple coalesce operations for comprehensive field coverage
+//   - May be resource-intensive; reduce timeRange if needed
+//
+// LAST UPDATED: 2026-01-19
+// VERSION: 2.0
+// ============================================================================
+
+// ============================================================================
+// CONFIGURATION PARAMETERS - CUSTOMIZE FOR YOUR INVESTIGATION
+// ============================================================================
+let deviceName = "workstation1";  // Target device hostname
+let fileName = "malicious.ps1";   // Target script filename or keyword
+let timeRange = ago(14d);          // Extended lookback for deleted files
+
+// ============================================================================
+// MAIN QUERY LOGIC - SCRIPT CONTENT RECOVERY
+// ============================================================================
+
+union isfuzzy=true
+// ============================================================================
+// Method 1: Script Block Logging (Event ID 4104)
+// ============================================================================
+// Primary source for script content recovery
+// Captures script blocks as they execute, including dynamically generated code
+(DeviceEvents
+| where Timestamp > timeRange
+| where DeviceName =~ deviceName
+| where ActionType == "PowerShellCommand"
+// Parse nested JSON structures (varies by MDE version/config)
+| extend
+    Fields = parse_json(AdditionalFields),
+    EventData = parse_json(tostring(parse_json(AdditionalFields).EventData))
+// Try multiple field paths to extract script block text
+// Different MDE configurations store content in different fields
+| extend
+    ScriptBlockText = coalesce(
+        tostring(Fields.ScriptBlockText),      // Primary field
+        tostring(Fields.Command),               // Alternative field
+        tostring(EventData.ScriptBlockText),    // Nested in EventData
+        tostring(EventData.Payload)             // Sometimes called Payload
+    ),
+    ScriptBlockId = tostring(Fields.ScriptBlockId),
+    MessageNumber = toint(Fields.MessageNumber),
+    MessageTotal = toint(Fields.MessageTotal)
+| where isnotempty(ScriptBlockText)
+// Filter to content matching our target
+| where ScriptBlockText contains fileName
+    or ScriptBlockText contains "malicious"  // Adjust keyword as needed
+    or ProcessCommandLine contains fileName
+    or ScriptBlockText matches regex @"(?i)\.ps1"  // Any PowerShell file reference
+| project
+    Timestamp,
+    RecoveryMethod = "ScriptBlockLogging",
+    ScriptContent = ScriptBlockText,
+    ScriptBlockId,
+    MessagePart = strcat(MessageNumber, "/", MessageTotal),  // For multi-part script blocks
+    ProcessCommandLine,
+    InitiatingProcessCommandLine,
+    InitiatingProcessAccountName,
+    DeviceName
+),
+// ============================================================================
+// Method 2: Command Line Arguments (Process Creation)
+// ============================================================================
+// Captures inline scripts and base64-encoded commands from process creation
+(DeviceProcessEvents
+| where Timestamp > timeRange
+| where DeviceName =~ deviceName
+| where FileName in~ ("powershell.exe", "pwsh.exe")
+| where ProcessCommandLine contains fileName or ProcessCommandLine contains "malicious"
+// Extract inline script content from various command-line parameter formats
+| extend
+    // -Command parameter with inline script
+    InlineScript = extract(@"-Command\s+\"([^\"]+)\"", 1, ProcessCommandLine),
+    // -File parameter with script path
+    FileParam = extract(@"-File\s+\"?([^\"]+\.ps1)", 1, ProcessCommandLine),
+    // -EncodedCommand (and variations: -Enc, -E, -Encoded)
+    EncodedCommand = extract(@"-E(?:nc(?:oded)?)?(?:Command)?\s+([A-Za-z0-9+/=]+)", 1, ProcessCommandLine)
+// Decode base64-encoded PowerShell commands
+| extend
+    DecodedScript = iff(
+        isnotempty(EncodedCommand),
+        base64_decode_tostring(EncodedCommand),
+        ""
+    )
+// Include if we found inline content or file reference
+| where isnotempty(InlineScript) or isnotempty(DecodedScript) or FileParam contains fileName
+| project
+    Timestamp,
+    RecoveryMethod = "CommandLine",
+    ScriptContent = coalesce(DecodedScript, InlineScript, "File execution - no inline content"),
+    ExecutedFile = FileParam,
+    ProcessCommandLine,
+    ProcessId,
+    InitiatingProcessId,
+    InitiatingProcessAccountName,
+    DeviceName
+),
+// ============================================================================
+// Method 3: AMSI (Anti-Malware Scan Interface)
+// ============================================================================
+// Captures script content as it's scanned by antimalware
+// Often contains full script content even for obfuscated scripts
+(DeviceEvents
+| where Timestamp > timeRange
+| where DeviceName =~ deviceName
+| where ActionType contains "Amsi" or ActionType == "AntiMalwareScanContent"
+| extend Fields = parse_json(AdditionalFields)
+| extend
+    ScannedContent = tostring(Fields.ScriptContent),
+    ContentName = tostring(Fields.ContentName),
+    ScanResult = tostring(Fields.ScanResult)
+// Filter to relevant content
+| where ContentName contains fileName
+    or ScannedContent contains "malicious"
+    or ScannedContent contains fileName
+    or ProcessCommandLine contains ".ps1"
+| project
+    Timestamp,
+    RecoveryMethod = "AMSI",
+    ScriptContent = ScannedContent,
+    ContentName,
+    ScanResult,
+    ProcessCommandLine,
+    InitiatingProcessAccountName,
+    DeviceName
+),
+// ============================================================================
+// Method 4: File System Events (with Content Metadata)
+// ============================================================================
+// Captures file operations; may have content references in some scenarios
+// Useful for timeline and hash correlation
+(DeviceFileEvents
+| where Timestamp > timeRange
+| where DeviceName =~ deviceName
+| where FileName =~ fileName
+// Left join with potential file content read events (if available)
+| join kind=leftouter (
+    DeviceEvents
+    | where Timestamp > timeRange
+    | where ActionType == "FileContentRead" or ActionType == "UsnJournalEventLogged"
+    | extend Fields = parse_json(AdditionalFields)
+) on DeviceName, $left.SHA256 == $right.SHA256
+| project
+    Timestamp,
+    RecoveryMethod = "FileSystem",
+    ActionType,
+    FileName,
+    FolderPath,
+    SHA256,
+    FileSize,
+    WasDeleted = iff(ActionType == "FileDeleted", true, false),
+    DeletedTime = iff(ActionType == "FileDeleted", Timestamp, datetime(null)),
+    InitiatingProcessCommandLine,
+    InitiatingProcessAccountName,
+    DeviceName
+)
+| sort by Timestamp asc
+// ============================================================================
+// POST-PROCESSING: RECONSTRUCT MULTI-PART SCRIPT BLOCKS
+// ============================================================================
+// Script block logging may split large scripts across multiple events
+// Group and reassemble them
+| summarize
+    ScriptParts = make_list(ScriptContent),
+    AllTimestamps = make_list(Timestamp),
+    Methods = make_set(RecoveryMethod),
+    FirstSeen = min(Timestamp),
+    LastSeen = max(Timestamp),
+    CommandLines = make_set(ProcessCommandLine),
+    Accounts = make_set(InitiatingProcessAccountName)
+by ScriptBlockId, RecoveryMethod, DeviceName
+| extend
+    // Reconstruct full script from parts
+    ReconstructedScript = strcat_array(ScriptParts, "\n"),
+    RecoverySuccess = case(
+        strlen(strcat_array(ScriptParts, "")) > 100, "High Confidence",
+        strlen(strcat_array(ScriptParts, "")) > 10, "Partial Recovery",
+        "Minimal Content"
+    )
+| project
+    FirstSeen,
+    LastSeen,
+    DeviceName,
+    RecoveryMethod,
+    RecoverySuccess,
+    ScriptBlockId,
+    ReconstructedScript,
+    ScriptParts,
+    Methods,
+    CommandLines,
+    Accounts
+| sort by FirstSeen desc
+
+// ============================================================================
+// TROUBLESHOOTING
+// ============================================================================
+// - If no results: Check if PowerShell logging is enabled
+// - If only partial content: Script may be split across multiple events
+//   * Check ScriptBlockId and look for related events
+// - If recovery quality is "Minimal": Try alternative detection methods
+//
+// ENABLE REQUIRED LOGGING:
+// 1. Script Block Logging (GPO):
+//    Computer Configuration > Administrative Templates > Windows Components >
+//    Windows PowerShell > Turn on PowerShell Script Block Logging
+// 2. Transcription (GPO - optional for additional coverage):
+//    Turn on PowerShell Transcription
+// 3. AMSI: Enabled by default on Windows 10+
+//
+// EXAMPLE INVESTIGATION WORKFLOWS:
+// 1. Find script execution timeline:
+//    - Review FirstSeen/LastSeen to understand execution timeframe
+// 2. Reconstruct deleted script:
+//    - Focus on RecoverySuccess = "High Confidence"
+//    - Review ReconstructedScript field
+// 3. Identify script purpose:
+//    - Search ReconstructedScript for IOCs (IPs, domains, file paths)
+// 4. Trace script distribution:
+//    - Use SHA256 from FileSystem method to find other affected devices
+//
+// FOLLOW-UP QUERIES:
+// - Find all executions of the same script (by hash):
+//   DeviceFileEvents
+//   | where SHA256 == "<hash_from_results>"
+//   | summarize Devices = make_set(DeviceName), FirstSeen = min(Timestamp)
+// - Check for network activity during execution:
+//   DeviceNetworkEvents
+//   | where DeviceName == "<device>"
+//   | where InitiatingProcessFileName in~ ("powershell.exe", "pwsh.exe")
+//   | where Timestamp between (datetime(<first_seen>) .. datetime(<last_seen>))
+// - Look for persistence mechanisms:
+//   DeviceRegistryEvents
+//   | where DeviceName == "<device>"
+//   | where InitiatingProcessFileName in~ ("powershell.exe", "pwsh.exe")
+//   | where Timestamp between (datetime(<first_seen>) .. datetime(<last_seen>))

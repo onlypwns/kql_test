@@ -1,0 +1,272 @@
+// ============================================================================
+// QUERY: Azure Storage Data Egress Monitoring
+// ============================================================================
+//
+// PURPOSE:
+//   Monitors data egress (outbound data transfer) from Azure Storage accounts
+//   to detect potential data exfiltration, unusual download activity, or
+//   performance anomalies that could indicate security issues or misconfigurations.
+//
+// MITRE ATT&CK:
+//   - T1530: Data from Cloud Storage Object
+//   - T1567.002: Exfiltration Over Web Service - Exfiltration to Cloud Storage
+//   - T1020: Automated Exfiltration
+//   - T1048: Exfiltration Over Alternative Protocol
+//
+// THREAT CONTEXT:
+//   Azure Storage accounts contain critical business data. Monitoring egress
+//   metrics helps detect unauthorized data exfiltration, compromised access
+//   keys, or malicious insiders downloading large volumes of data. Unusual
+//   egress patterns may also indicate ransomware preparation (backup before
+//   encryption) or competitive intelligence theft.
+//
+// DATA SOURCE:
+//   - AzureMetrics (Storage account metrics)
+//   - Requires: Azure Storage account with diagnostic settings and metrics enabled
+//
+// DETECTION METHOD:
+//   Analyzes storage account egress metrics to identify unusual data transfer
+//   patterns, high-volume downloads, or sustained egress that could indicate
+//   data exfiltration.
+//
+// RECOMMENDATIONS:
+//   - Alert on egress spikes (>3x baseline) for investigation
+//   - Monitor egress from sensitive storage accounts
+//   - Correlate egress with authentication events
+//   - Review access logs for related blob/file downloads
+//   - Implement network restrictions and private endpoints
+//
+// PERFORMANCE NOTES:
+//   - Estimated execution time: < 10 seconds for 30 days of data
+//   - Lightweight query using pre-aggregated metrics
+//   - Suitable for real-time dashboards and alerting
+//
+// KNOWN FALSE POSITIVES:
+//   - Legitimate large file downloads or backups
+//   - CDN pull operations for public content
+//   - Disaster recovery testing or data migrations
+//   - Rate: Medium-High (20-30% without baseline tuning)
+//
+// LAST UPDATED: 2026-01-19
+// VERSION: 2.0
+// ============================================================================
+
+// Configuration Parameters
+let lookbackPeriod = 30d;     // Time window for analysis
+let minEgressGB = 10.0;        // Minimum egress in GB to flag (adjust for your environment)
+let highEgressThresholdGB = 100.0;  // Threshold for high egress alert
+
+// Main Detection Logic
+AzureMetrics
+| where TimeGenerated >= ago(lookbackPeriod)
+// Filter to Azure Storage metrics
+| where ResourceProvider == "MICROSOFT.STORAGE"
+// Focus on egress (outbound data transfer) metric
+| where MetricName == "Egress"
+// ============================================================================
+// AGGREGATE AND ANALYZE EGRESS PATTERNS
+// ============================================================================
+// Convert bytes to GB for easier analysis
+| extend EgressGB = round(Total / (1024.0 * 1024.0 * 1024.0), 2)
+// Group by storage account and time window
+| summarize
+    TotalEgressGB = sum(EgressGB),
+    MaxEgressGB = max(EgressGB),
+    AvgEgressGB = round(avg(EgressGB), 2),
+    DataPoints = count(),
+    FirstSeen = min(TimeGenerated),
+    LastSeen = max(TimeGenerated)
+by Resource, ResourceGroup, bin(TimeGenerated, 1d)  // Daily aggregation
+// Filter to significant egress events
+| where TotalEgressGB >= minEgressGB
+// ============================================================================
+// CALCULATE EGRESS PATTERNS AND ANOMALIES
+// ============================================================================
+| extend
+    EgressDurationDays = round(datetime_diff('day', LastSeen, FirstSeen) + 1, 0),
+    // Risk classification based on volume
+    EgressCategory = case(
+        TotalEgressGB >= highEgressThresholdGB, "Critical - Very High Volume",
+        TotalEgressGB >= 50, "High - Significant Volume",
+        TotalEgressGB >= 25, "Medium - Elevated Volume",
+        "Low - Normal Volume"
+    ),
+    // Risk scoring
+    RiskScore = case(
+        TotalEgressGB >= highEgressThresholdGB, "Critical",
+        TotalEgressGB >= 50, "High",
+        TotalEgressGB >= 25, "Medium",
+        "Low"
+    )
+// Enrich with risk indicators
+| extend
+    RiskIndicator = strcat("Storage Egress: ", EgressCategory),
+    PotentialThreat = case(
+        TotalEgressGB >= highEgressThresholdGB, "Possible Large-Scale Exfiltration",
+        TotalEgressGB >= 50, "Unusual Data Transfer Volume",
+        "Elevated Egress Activity"
+    )
+// ============================================================================
+// OUTPUT WITH PRIORITIZATION
+// ============================================================================
+| project
+    Date = TimeGenerated,
+    StorageAccountName = Resource,
+    ResourceGroup,
+    TotalEgressGB,
+    MaxEgressGB,
+    AvgEgressGB,
+    EgressCategory,
+    RiskScore,
+    RiskIndicator,
+    PotentialThreat,
+    FirstSeen,
+    LastSeen,
+    DataPoints
+| sort by RiskScore desc, TotalEgressGB desc, Date desc
+
+// ============================================================================
+// TROUBLESHOOTING
+// ============================================================================
+// - If no results: No significant egress detected (good!) or metrics not enabled
+// - If too many results: Increase minEgressGB threshold or filter specific accounts
+// - If missing expected data: Check that metrics collection is enabled
+//
+// ENABLE STORAGE METRICS:
+// Azure Portal > Storage Account > Monitoring > Diagnostic settings
+// Enable metrics:
+// - Transaction metrics
+// - Capacity metrics (for Blob storage)
+// Send to: Log Analytics workspace
+//
+// ESTABLISH BASELINE:
+// Run this query over 30-90 days to understand normal egress patterns:
+//   AzureMetrics
+//   | where ResourceProvider == "MICROSOFT.STORAGE"
+//   | where MetricName == "Egress"
+//   | extend EgressGB = Total / (1024*1024*1024)
+//   | summarize AvgDaily = avg(EgressGB), P95 = percentile(EgressGB, 95)
+//              by Resource
+// Set minEgressGB and highEgressThresholdGB based on P95 values
+//
+// EXAMPLE INVESTIGATION WORKFLOWS:
+// 1. Data exfiltration investigation:
+//    - Identify storage account with critical/high egress
+//    - Review storage analytics logs for download operations
+//    - Check authentication logs for suspicious access
+//    - Identify what data was accessed
+// 2. Baseline deviation analysis:
+//    - Compare current egress with historical averages
+//    - Look for sudden spikes or sustained high egress
+//    - Correlate with known events (migrations, backups, etc.)
+// 3. Pattern analysis:
+//    - Check if egress is during business hours or off-hours
+//    - Review if egress is from specific blob containers
+//    - Identify if multiple accounts show similar patterns
+//
+// FOLLOW-UP QUERIES:
+// - Get detailed egress timeline for specific storage account:
+//   AzureMetrics
+//   | where Resource == "<storage_account>"
+//   | where MetricName == "Egress"
+//   | extend EgressGB = round(Total / (1024*1024*1024), 2)
+//   | project TimeGenerated, EgressGB
+//   | sort by TimeGenerated desc
+//   | render timechart
+//
+// - Check storage account access logs (requires storage logging):
+//   StorageBlobLogs
+//   | where AccountName == "<storage_account>"
+//   | where OperationName == "GetBlob"
+//   | where TimeGenerated >= ago(7d)
+//   | summarize DownloadCount = count(), TotalBytes = sum(ResponseBodySize)
+//              by CallerIpAddress, Uri
+//   | sort by TotalBytes desc
+//
+// - Correlate with authentication events:
+//   SigninLogs
+//   | where TimeGenerated >= ago(7d)
+//   | where AppDisplayName contains "Storage"
+//   | project TimeGenerated, UserPrincipalName, IPAddress, Location
+//   | sort by TimeGenerated desc
+//
+// - Compare egress across all storage accounts:
+//   AzureMetrics
+//   | where MetricName == "Egress"
+//   | where TimeGenerated >= ago(7d)
+//   | extend EgressGB = Total / (1024*1024*1024)
+//   | summarize TotalEgressGB = sum(EgressGB) by Resource
+//   | sort by TotalEgressGB desc
+//
+// - Monitor for sustained high egress (potential bulk exfiltration):
+//   AzureMetrics
+//   | where MetricName == "Egress"
+//   | where Resource == "<storage_account>"
+//   | extend EgressGB = Total / (1024*1024*1024)
+//   | summarize AvgEgress = avg(EgressGB) by bin(TimeGenerated, 1h)
+//   | where AvgEgress > <threshold>
+//   | render timechart
+//
+// RESPONSE ACTIONS:
+// 1. **CRITICAL** (RiskScore = "Critical"):
+//    - Immediately review storage account access logs
+//    - Rotate storage account keys if compromise suspected
+//    - Enable private endpoints and disable public access
+//    - Check for unauthorized SAS tokens
+//    - Contact data owners to verify legitimacy
+// 2. **HIGH** (Significant volume):
+//    - Investigate caller IP addresses and identities
+//    - Review what blobs/files were downloaded
+//    - Check for data classification violations
+//    - Assess business justification for transfer
+// 3. **INVESTIGATION**:
+//    - Correlate with security alerts and authentication logs
+//    - Review Network Watcher logs if available
+//    - Check for lateral movement or privilege escalation
+//    - Document timeline and data accessed
+// 4. **PREVENTION**:
+//    - Implement Azure Private Link for storage accounts
+//    - Enable storage account firewall rules
+//    - Use Azure AD authentication instead of shared keys
+//    - Implement Conditional Access for storage access
+//    - Enable Azure Defender for Storage
+//    - Configure soft delete and versioning
+//    - Implement data loss prevention (DLP) policies
+//    - Use customer-managed keys for encryption
+//
+// EGRESS MONITORING BEST PRACTICES:
+// - Establish baseline egress patterns per storage account
+// - Set up anomaly-based alerts (ML or threshold-based)
+// - Enable storage analytics logging
+// - Implement network flow logs
+// - Use Azure Monitor Workbooks for visualization
+// - Configure alerts for egress spikes (>3x baseline)
+// - Regular review of storage access policies
+// - Implement least-privilege access controls
+//
+// COMMON LEGITIMATE HIGH-EGRESS SCENARIOS:
+// - Disaster recovery failover or testing
+// - Data migration to new environment
+// - Large backup operations
+// - CDN cache population
+// - Database exports or data warehouse loads
+// - Media streaming or large file distribution
+// - Machine learning training data downloads
+// - Development/test environment refreshes
+//
+// DATA EXFILTRATION INDICATORS:
+// - Sustained high egress outside business hours
+// - Egress from compromised user accounts (check risky users)
+// - Downloads of entire containers or many small files
+// - Access from unusual geographic locations
+// - Use of programmatic access (REST API, SDKs) vs. portal
+// - Correlated with recent privilege escalation
+// - Multiple storage accounts affected simultaneously
+// - Deletion of access logs after high egress
+//
+// INTEGRATION:
+// - Create Azure Monitor alert rules for automated response
+// - Export to SIEM for correlation with other security events
+// - Trigger Logic Apps or Azure Functions for remediation
+// - Integrate with Azure Sentinel for advanced analytics
+// - Dashboard in Azure Monitor Workbooks or Power BI

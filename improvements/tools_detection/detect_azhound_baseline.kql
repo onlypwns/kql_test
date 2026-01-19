@@ -1,0 +1,126 @@
+// ============================================================================
+// QUERY: AzureHound Baseline Detection via UserAgent
+// ============================================================================
+//
+// PURPOSE:
+//   Provides a simple baseline detection for AzureHound activity by identifying
+//   the literal "azurehound" string in UserAgent headers of Microsoft Graph
+//   API calls.
+//
+// MITRE ATT&CK:
+//   - T1087.004: Account Discovery - Cloud Account
+//   - T1069.003: Permission Groups Discovery - Cloud Groups
+//   - T1526: Cloud Service Discovery
+//
+// THREAT CONTEXT:
+//   AzureHound is the Azure/Entra ID collector for BloodHound. When not
+//   configured to use stealthy UserAgent strings, it may include "azurehound"
+//   in its UserAgent, making detection straightforward. Note that sophisticated
+//   attackers often modify this default behavior.
+//
+// DATA SOURCE:
+//   - MicrosoftGraphActivityLogs
+//   - Requires: Microsoft 365 E5 or Microsoft Entra ID P2 license
+//
+// DETECTION METHOD:
+//   Simple UserAgent string matching for "azurehound" substring. This is a
+//   baseline detection; use detect_azurehound.kql for more sophisticated
+//   pattern-based detection.
+//
+// RECOMMENDATIONS:
+//   - Alert on all matches (very high confidence)
+//   - Investigate the user/service principal immediately
+//   - Review all Graph API activity from the same session
+//   - Check for privilege escalation attempts
+//   - Use this in combination with pattern-based detection queries
+//
+// PERFORMANCE NOTES:
+//   - Estimated execution time: < 5 seconds for 30 days of data
+//   - Very efficient with simple contains filter
+//   - Suitable for real-time alerting
+//
+// KNOWN FALSE POSITIVES:
+//   - Authorized penetration testing or red team engagements
+//   - Security assessment tools that use AzureHound legitimately
+//   - Rate: Very Low (< 0.1% - should be investigated every time)
+//
+// LAST UPDATED: 2026-01-19
+// VERSION: 2.0
+// ============================================================================
+
+// Configuration Parameters
+let lookbackPeriod = 30d;  // Adjust based on retention and investigation needs
+
+// Main Detection Logic
+MicrosoftGraphActivityLogs
+| where TimeGenerated >= ago(lookbackPeriod)
+// Detect "azurehound" in UserAgent
+| where UserAgent contains "azurehound"
+// Determine object type (user vs service principal)
+| extend
+    ObjectId = iff(isempty(UserId), ServicePrincipalId, UserId),
+    ObjectType = iff(isempty(UserId), "ServicePrincipal", "User")
+// Summarize activity by object and IP address
+| summarize
+    FirstSeen = min(TimeGenerated),
+    LastSeen = max(TimeGenerated),
+    CallCount = count(),
+    UniqueEndpoints = dcount(RequestUri),
+    GraphEndpoints = make_set(RequestUri, 100),  // Capture up to 100 unique endpoints
+    UserAgents = make_set(UserAgent),
+    ResponseCodes = make_set(ResponseStatusCode)
+by ObjectId, ObjectType, IPAddress
+// Enrich with risk metadata
+| extend
+    RiskIndicator = "AzureHound UserAgent Detected",
+    Severity = "Critical",
+    ConfidenceLevel = "Very High"
+| project
+    FirstSeen,
+    LastSeen,
+    ObjectId,
+    ObjectType,
+    IPAddress,
+    CallCount,
+    UniqueEndpoints,
+    UserAgents,
+    GraphEndpoints,
+    ResponseCodes,
+    RiskIndicator,
+    Severity,
+    ConfidenceLevel
+| sort by FirstSeen desc
+
+// TROUBLESHOOTING:
+// - If no results: Good! No obvious AzureHound activity detected
+// - If results found: Immediately investigate - this is high-confidence detection
+// - To get user details: Join with IdentityInfo or SigninLogs using ObjectId
+//
+// EXAMPLE INVESTIGATION QUERIES:
+// - Get full Graph API call timeline for flagged object:
+//   MicrosoftGraphActivityLogs
+//   | where UserId == "<detected_object_id>" or ServicePrincipalId == "<detected_object_id>"
+//   | project TimeGenerated, RequestUri, RequestMethod, ResponseStatusCode, UserAgent
+//   | sort by TimeGenerated asc
+// - Check for authentication events:
+//   SigninLogs
+//   | where UserId == "<detected_object_id>"
+//   | project TimeGenerated, IPAddress, Location, ResultType, AppDisplayName
+// - Search for related activity from same IP:
+//   MicrosoftGraphActivityLogs
+//   | where IPAddress == "<detected_ip>"
+//   | summarize Users = make_set(UserId), SPNs = make_set(ServicePrincipalId),
+//              CallCount = count() by bin(TimeGenerated, 1h)
+//
+// RESPONSE ACTIONS:
+// 1. **IMMEDIATE**: Revoke all active sessions for the detected account
+// 2. **IMMEDIATE**: Disable the account pending investigation
+// 3. Reset all credentials and secrets for the account
+// 4. Review Azure AD audit logs for:
+//    - Role assignments or privilege changes
+//    - Application registrations or modifications
+//    - Consent grants to suspicious applications
+// 5. Assess data exfiltration risk:
+//    - Check what data the account accessed
+//    - Review Graph API calls for sensitive operations
+// 6. If authorized testing: Document and create exception rule

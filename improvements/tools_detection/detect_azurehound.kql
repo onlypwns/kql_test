@@ -1,0 +1,154 @@
+// ============================================================================
+// QUERY: AzureHound Detection via Graph API Endpoint Pattern Analysis
+// ============================================================================
+//
+// PURPOSE:
+//   Detects AzureHound reconnaissance activity by analyzing Microsoft Graph
+//   API call patterns. Uses endpoint normalization to identify the specific
+//   sequence of API calls characteristic of AzureHound enumeration.
+//
+// MITRE ATT&CK:
+//   - T1087.004: Account Discovery - Cloud Account
+//   - T1069.003: Permission Groups Discovery - Cloud Groups
+//   - T1526: Cloud Service Discovery
+//   - T1018: Remote System Discovery
+//
+// THREAT CONTEXT:
+//   AzureHound is the Azure/Entra ID data collector for BloodHound, used
+//   to map Azure AD attack paths. It makes distinctive patterns of Graph
+//   API calls to enumerate users, groups, roles, service principals, and
+//   role assignments.
+//
+// DATA SOURCE:
+//   - MicrosoftGraphActivityLogs
+//   - Requires: Microsoft 365 E5 or Microsoft Entra ID P2 license
+//
+// DETECTION METHOD:
+//   Normalizes API endpoint patterns by removing UUIDs and query parameters,
+//   then calculates confidence score based on overlap with known AzureHound
+//   Graph API endpoints.
+//
+// RECOMMENDATIONS:
+//   - Alert on confidence score > 0.7 (indicates 70%+ match with AzureHound pattern)
+//   - Investigate the user/service principal making the calls
+//   - Review all API calls from the same token/session
+//   - Check for privilege escalation or role assignment changes
+//
+// PERFORMANCE NOTES:
+//   - Estimated execution time: 15-30 seconds for 3 days of data
+//   - Uses ingestion_time() for better performance
+//   - Regex operations are computationally expensive - limit time range if slow
+//
+// KNOWN FALSE POSITIVES:
+//   - Legitimate Azure AD management tools or scripts
+//   - Third-party security assessment tools
+//   - Rate: Medium (5-10% in environments with active Azure AD management)
+//
+// LAST UPDATED: 2026-01-19
+// VERSION: 2.0
+// ============================================================================
+
+// Configuration Parameters
+let lookbackPeriod = 3d;  // Adjust based on investigation needs
+let confidenceThreshold = 0.7;  // Minimum overlap ratio to flag (0.7 = 70%)
+
+// Known AzureHound Graph API Endpoint Patterns
+// These represent typical enumeration queries made by AzureHound
+let AzureHoundGraphQueries = dynamic([
+    "https://graph.microsoft.com/v1.0/users",
+    "https://graph.microsoft.com/v1.0/groups",
+    "https://graph.microsoft.com/v1.0/groups/<UUID>/members",
+    "https://graph.microsoft.com/v1.0/servicePrincipals",
+    "https://graph.microsoft.com/v1.0/applications",
+    "https://graph.microsoft.com/v1.0/directoryRoles",
+    "https://graph.microsoft.com/v1.0/directoryRoles/<UUID>/members",
+    "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments",
+    "https://graph.microsoft.com/v1.0/roleManagement/directory/roleDefinitions",
+    "https://graph.microsoft.com/beta/servicePrincipals/<UUID>/appRoleAssignedTo",
+    "https://graph.microsoft.com/beta/users/<UUID>/appRoleAssignments",
+    "https://graph.microsoft.com/v1.0/organization",
+    "https://graph.microsoft.com/v1.0/domains",
+    "https://graph.microsoft.com/v1.0/subscribedSkus",
+    "https://graph.microsoft.com/beta/devices"
+]);
+
+// Main Detection Logic
+MicrosoftGraphActivityLogs
+| where ingestion_time() > ago(lookbackPeriod)
+// Determine if this is a user or service principal
+| extend
+    ObjectId = iff(isempty(UserId), ServicePrincipalId, UserId),
+    ObjectType = iff(isempty(UserId), "ServicePrincipal", "User"),
+    UniqueTokenIdentifier = SignInActivityId
+// Filter out delta query noise (continuous sync operations)
+| where RequestUri !has "microsoft.graph.delta"
+// Normalize RequestUri by removing UUIDs (e.g., user/group/app IDs)
+| extend NormalizedRequestUri = replace_regex(
+    RequestUri,
+    @'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}',
+    '<UUID>'
+)
+// Remove query parameters to focus on endpoint patterns
+| extend NormalizedRequestUri = replace_regex(NormalizedRequestUri, @'\?.*$', '')
+// Group by unique token to identify single session/campaign
+| summarize
+    GraphEndpointsCalled = make_set(NormalizedRequestUri),
+    IPAddresses = make_set(IPAddress),
+    UserAgents = make_set(UserAgent),
+    CallCount = count()
+by ObjectId, ObjectType, UniqueTokenIdentifier
+// Calculate overlap between observed endpoints and known AzureHound patterns
+| project
+    ObjectId,
+    ObjectType,
+    UniqueTokenIdentifier,
+    IPAddresses,
+    UserAgents,
+    CallCount,
+    GraphEndpointsCalled,
+    MatchingQueries = set_intersect(AzureHoundGraphQueries, GraphEndpointsCalled)
+// Calculate confidence score as ratio of matched patterns
+// SYNTAX FIX: Original had missing '/' operator between two todouble() calls
+| extend ConfidenceScore = round(
+    todouble(array_length(MatchingQueries)) / todouble(array_length(AzureHoundGraphQueries)),
+    2
+)
+// Filter to high-confidence detections
+| where ConfidenceScore > confidenceThreshold
+// Enrich with risk metadata
+| extend
+    RiskIndicator = "AzureHound Graph API Pattern Detected",
+    Severity = case(
+        ConfidenceScore >= 0.9, "Critical",
+        ConfidenceScore >= 0.8, "High",
+        "Medium"
+    )
+| project
+    ObjectId,
+    ObjectType,
+    ConfidenceScore,
+    MatchedPatterns = array_length(MatchingQueries),
+    TotalCalls = CallCount,
+    IPAddresses,
+    UserAgents,
+    MatchingQueries,
+    GraphEndpointsCalled,
+    RiskIndicator,
+    Severity,
+    UniqueTokenIdentifier
+| sort by ConfidenceScore desc
+
+// TROUBLESHOOTING:
+// - If no results: Check if MicrosoftGraphActivityLogs table exists
+// - If too many results: Increase confidenceThreshold to 0.8 or 0.9
+// - To investigate specific token: Filter by UniqueTokenIdentifier
+//
+// EXAMPLE INVESTIGATION QUERIES:
+// - Get all calls for a flagged token:
+//   MicrosoftGraphActivityLogs
+//   | where SignInActivityId == "<token_id>"
+//   | project TimeGenerated, RequestUri, ResponseStatusCode
+// - Check if user has elevated roles:
+//   IdentityInfo
+//   | where AccountUPN == "<detected_user>"
+//   | project AssignedRoles

@@ -1,0 +1,253 @@
+// ============================================================================
+// QUERY: Risky User Microsoft Graph API Activity Analysis
+// ============================================================================
+//
+// PURPOSE:
+//   Correlates Azure AD risky users with their Microsoft Graph API activity
+//   to identify suspicious API calls made by potentially compromised accounts.
+//   This helps detect post-compromise reconnaissance and data exfiltration.
+//
+// MITRE ATT&CK:
+//   - T1078: Valid Accounts
+//   - T1087.004: Account Discovery - Cloud Account
+//   - T1114.002: Email Collection - Remote Email Collection
+//   - T1213.003: Data from Information Repositories - Code Repositories
+//   - T1530: Data from Cloud Storage Object
+//
+// THREAT CONTEXT:
+//   After compromising an account, adversaries often use Microsoft Graph API
+//   to enumerate the environment, access emails, download files, and exfiltrate
+//   data. By correlating risky users with Graph API activity, we can detect
+//   post-compromise activities early.
+//
+// DATA SOURCES:
+//   - MicrosoftGraphActivityLogs (Graph API calls)
+//   - AADRiskyUsers (Identity Protection risk data)
+//   - Requires: Azure AD Premium P2 + Microsoft 365 E5 or equivalent
+//
+// DETECTION METHOD:
+//   Joins risky users with their Graph API activity, normalizes API endpoints,
+//   and identifies suspicious access patterns while filtering out benign
+//   organizational queries.
+//
+// RECOMMENDATIONS:
+//   - Alert on risky users with high Graph API activity
+//   - Investigate resource paths accessed (especially sensitive APIs)
+//   - Check for data exfiltration indicators
+//   - Review response codes for successful unauthorized access
+//   - Revoke active sessions and force re-authentication
+//
+// PERFORMANCE NOTES:
+//   - Estimated execution time: 15-30 seconds for 30 days of data
+//   - Join operation may be resource-intensive
+//   - Consider reducing lookback period for faster results
+//
+// KNOWN FALSE POSITIVES:
+//   - Legitimate users flagged by Identity Protection using Graph-based tools
+//   - Administrators performing normal duties after password reset
+//   - Rate: Low-Medium (5-10% with proper filtering)
+//
+// LAST UPDATED: 2026-01-19
+// VERSION: 2.0
+// ============================================================================
+
+// Configuration Parameters
+let lookbackPeriod = 30d;  // Time window for Graph API activity analysis
+let minRequestCount = 5;    // Minimum number of API calls to include
+let includePhotoRequests = false;  // Filter out profile photo requests (usually benign)
+
+// Main Detection Logic
+MicrosoftGraphActivityLogs
+| where TimeGenerated > ago(lookbackPeriod)
+// Join with risky users to identify compromised accounts
+| join kind=inner AADRiskyUsers on $left.UserId == $right.Id
+// Extract and normalize the resource path from RequestUri
+// Remove version prefix (v1.0/beta) and URL parameters for pattern analysis
+| extend resourcePath = replace_string(
+    replace_string(
+        replace_regex(tostring(parse_url(RequestUri).Path), @'(\/)+', '/'),  // Normalize multiple slashes
+        'v1.0/',
+        ''
+    ),
+    'beta/',
+    ''
+)
+// ============================================================================
+// FILTER OUT KNOWN BENIGN PATTERNS
+// ============================================================================
+// Exclude profile photos (usually automatic/benign requests)
+| where includePhotoRequests or resourcePath !contains "photo"
+// Exclude organization info queries (often automated)
+| where resourcePath != "/organization"
+// Exclude directory role queries (common for admin portals)
+| where resourcePath != "/directoryRoles"
+// Filter to successful API calls (ResponseStatusCode 200)
+| where ResponseStatusCode == 200
+// ============================================================================
+// AGGREGATE AND ANALYZE ACTIVITY PATTERNS
+// ============================================================================
+// Summarize activity by user and resource path
+| summarize
+    FirstActivity = min(TimeGenerated),
+    LastActivity = max(TimeGenerated),
+    RequestCount = dcount(RequestId),
+    TotalCalls = count(),
+    IPAddresses = make_set(IPAddress),
+    UserAgents = make_set(UserAgent),
+    Methods = make_set(RequestMethod)
+by UserPrincipalName, resourcePath, ResponseStatusCode, RiskLevel, RiskState, RiskDetail
+// Filter to accounts with significant activity
+| where RequestCount >= minRequestCount
+// ============================================================================
+// RISK SCORING AND CLASSIFICATION
+// ============================================================================
+| extend
+    // Categorize API endpoints by sensitivity
+    DataSensitivity = case(
+        resourcePath contains "/messages" or resourcePath contains "/mailFolders", "High - Email Access",
+        resourcePath contains "/drive" or resourcePath contains "/files", "High - File Access",
+        resourcePath contains "/users" or resourcePath contains "/people", "Medium - User Enumeration",
+        resourcePath contains "/groups", "Medium - Group Enumeration",
+        resourcePath contains "/calendars", "Medium - Calendar Access",
+        resourcePath contains "/contacts", "Medium - Contact Enumeration",
+        resourcePath contains "/applications" or resourcePath contains "/servicePrincipals", "High - App Discovery",
+        "Low - General Query"
+    ),
+    // Risk scoring based on user risk level and activity
+    ThreatScore = case(
+        RiskLevel == "high" and RequestCount > 50, "Critical",
+        RiskLevel == "high" and RequestCount > 20, "High",
+        RiskLevel == "high", "Medium",
+        RiskLevel == "medium" and RequestCount > 50, "High",
+        RiskLevel == "medium", "Medium",
+        "Low"
+    ),
+    // Calculate activity duration
+    ActivityDurationHours = round(datetime_diff('hour', LastActivity, FirstActivity), 1),
+    // Indicator based on resource accessed
+    RiskIndicator = strcat("Risky User - ", DataSensitivity)
+// ============================================================================
+// OUTPUT WITH PRIORITIZATION
+// ============================================================================
+| project
+    UserPrincipalName,
+    RiskLevel,
+    RiskState,
+    RiskDetail,
+    resourcePath,
+    DataSensitivity,
+    ThreatScore,
+    RequestCount,
+    TotalCalls,
+    FirstActivity,
+    LastActivity,
+    ActivityDurationHours,
+    IPAddresses,
+    UserAgents,
+    Methods,
+    ResponseStatusCode,
+    RiskIndicator
+| sort by ThreatScore desc, RequestCount desc
+
+// ============================================================================
+// TROUBLESHOOTING
+// ============================================================================
+// - If no results: No risky users with Graph API activity (good!)
+// - If too many results: Increase minRequestCount or filter by specific paths
+// - If missing expected activity: Check lookback period and ensure both tables have data
+//
+// VERIFY DATA AVAILABILITY:
+// - Check if AADRiskyUsers has entries:
+//   AADRiskyUsers | where RiskLevel == "high" | count
+// - Check if MicrosoftGraphActivityLogs is collecting:
+//   MicrosoftGraphActivityLogs | where TimeGenerated > ago(1d) | count
+//
+// EXAMPLE INVESTIGATION WORKFLOWS:
+// 1. Triage by threat level:
+//    - Start with ThreatScore = "Critical" or "High"
+//    - Review DataSensitivity for impact assessment
+// 2. Analyze access patterns:
+//    - Check ActivityDurationHours (long duration = persistent access)
+//    - Review RequestCount (high count = enumeration or exfiltration)
+// 3. Correlate with authentication:
+//    - Use follow-up query to check authentication timeline
+//    - Identify when risk was first detected vs. API activity
+//
+// FOLLOW-UP QUERIES:
+// - Get detailed Graph API calls for specific user:
+//   MicrosoftGraphActivityLogs
+//   | where UserPrincipalName == "<flagged_user>"
+//   | where TimeGenerated between (datetime(<first_activity>) .. datetime(<last_activity>))
+//   | project TimeGenerated, RequestUri, RequestMethod, ResponseStatusCode, IPAddress
+//   | sort by TimeGenerated asc
+//
+// - Check authentication timeline for risky user:
+//   SigninLogs
+//   | where UserPrincipalName == "<flagged_user>"
+//   | where TimeGenerated >= ago(30d)
+//   | project TimeGenerated, IPAddress, Location, RiskLevelDuringSignIn,
+//             RiskDetail, ResultType, AppDisplayName
+//   | sort by TimeGenerated desc
+//
+// - Identify specific resources accessed:
+//   MicrosoftGraphActivityLogs
+//   | where UserPrincipalName == "<flagged_user>"
+//   | where RequestUri contains "/messages" or RequestUri contains "/drive"
+//   | project TimeGenerated, RequestUri, ResponseStatusCode
+//   | sort by TimeGenerated asc
+//
+// - Check for data exfiltration patterns (high volume GET requests):
+//   MicrosoftGraphActivityLogs
+//   | where UserPrincipalName == "<flagged_user>"
+//   | where RequestMethod == "GET"
+//   | summarize CallCount = count(), DataEndpoints = make_set(RequestUri)
+//              by bin(TimeGenerated, 1h)
+//   | where CallCount > 100  // Unusually high volume
+//
+// RESPONSE ACTIONS:
+// 1. **IMMEDIATE** (for ThreatScore = "Critical"):
+//    - Revoke all active sessions immediately
+//    - Disable user account pending investigation
+//    - Alert security team and user's manager
+// 2. **URGENT** (for DataSensitivity = "High"):
+//    - Review exactly what resources were accessed
+//    - Check for email access, file downloads, or sensitive data queries
+//    - Assess data exfiltration risk
+// 3. **INVESTIGATION**:
+//    - Document full timeline of risky activities
+//    - Identify initial compromise vector
+//    - Determine scope of data accessed
+//    - Check for lateral movement or privilege escalation
+// 4. **REMEDIATION**:
+//    - Force password reset with MFA re-enrollment
+//    - Review and revoke OAuth application consents
+//    - Remove mailbox rules or delegations
+//    - Scan for persistence mechanisms
+//    - Document incident for compliance reporting
+//
+// HIGH-RISK RESOURCE PATHS TO PRIORITIZE:
+// - /users - User enumeration (common reconnaissance)
+// - /messages - Email access (potential data exfiltration)
+// - /mailFolders - Mailbox folder access (sensitive data)
+// - /drive/root - OneDrive root access (file exfiltration)
+// - /drive/items - Specific file access
+// - /me/drive - Personal drive access
+// - /sites/*/drive - SharePoint site access
+// - /groups/*/drive - Group drive access
+// - /applications - Application enumeration (attack planning)
+// - /servicePrincipals - Service principal discovery (privilege escalation)
+// - /directoryRoles - Role enumeration (privilege discovery)
+// - /roleAssignments - Role assignment discovery
+//
+// DATA EXFILTRATION INDICATORS:
+// - High RequestCount (>100) to /messages or /drive endpoints
+// - Continuous activity over long ActivityDurationHours (>6 hours)
+// - GET requests to multiple different resource paths
+// - Access from unusual IPAddresses or UserAgents
+// - Activity shortly after RiskState changed to "atRisk"
+//
+// INTEGRATION:
+// - Create scheduled alert for ThreatScore = "Critical" or "High"
+// - Export findings to SIEM for correlation
+// - Trigger automated response playbooks via Logic Apps
+// - Generate executive reports for compliance

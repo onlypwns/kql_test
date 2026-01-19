@@ -1,0 +1,153 @@
+// ============================================================================
+// QUERY: AzureHound Detection via Specific Token Analysis
+// ============================================================================
+//
+// PURPOSE:
+//   Performs detailed analysis of Microsoft Graph API activity for a specific
+//   token/session identified by SignInActivityId. Useful for investigating
+//   a known suspicious token or conducting deep-dive forensics on AzureHound
+//   activity.
+//
+// MITRE ATT&CK:
+//   - T1087.004: Account Discovery - Cloud Account
+//   - T1069.003: Permission Groups Discovery - Cloud Groups
+//   - T1526: Cloud Service Discovery
+//
+// THREAT CONTEXT:
+//   Once a suspicious token is identified (via other detection methods or
+//   threat intelligence), this query provides detailed visibility into all
+//   Graph API calls made using that token. This is essential for understanding
+//   the scope of reconnaissance or data access.
+//
+// DATA SOURCE:
+//   - MicrosoftGraphActivityLogs
+//   - Requires: Microsoft 365 E5 or Microsoft Entra ID P2 license
+//
+// DETECTION METHOD:
+//   Filters Graph API activity by specific SignInActivityId (token identifier),
+//   then normalizes API endpoints to reveal patterns of API usage.
+//
+// RECOMMENDATIONS:
+//   - Use this query for token-level investigation after initial detection
+//   - Analyze the GraphEndpointsCalled to understand what data was accessed
+//   - Compare normalized endpoints against AzureHound patterns
+//   - Document findings for incident response timeline
+//
+// PERFORMANCE NOTES:
+//   - Estimated execution time: < 5 seconds (very targeted query)
+//   - Highly efficient due to specific token filter
+//   - Suitable for interactive investigation
+//
+// LAST UPDATED: 2026-01-19
+// VERSION: 2.0
+// ============================================================================
+
+// Configuration Parameters
+// IMPORTANT: Replace with actual SignInActivityId from your investigation
+let targetTokenId = "8cVAJubu7Ea-bUsbdgsgAA";  // Example token - REPLACE THIS
+let lookbackPeriod = 30d;  // Extend if investigating older activity
+
+// Main Analysis Logic
+MicrosoftGraphActivityLogs
+| where TimeGenerated >= ago(lookbackPeriod)
+// Filter to specific token/session
+| where SignInActivityId contains targetTokenId
+// Enrich with object identification
+| extend
+    ObjectId = iff(isempty(UserId), ServicePrincipalId, UserId),
+    ObjectType = iff(isempty(UserId), "ServicePrincipal", "User")
+// Normalize RequestUri to identify patterns (remove UUIDs)
+| extend NormalizedRequestUri = replace_regex(
+    RequestUri,
+    @'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}',
+    '<UUID>'
+)
+// Remove query parameters to focus on endpoint structure
+| extend NormalizedRequestUri = replace_regex(NormalizedRequestUri, @'\?.*$', '')
+// Aggregate all activity for this token
+| summarize
+    FirstActivity = min(TimeGenerated),
+    LastActivity = max(TimeGenerated),
+    TotalCalls = count(),
+    SuccessfulCalls = countif(ResponseStatusCode == 200),
+    FailedCalls = countif(ResponseStatusCode != 200),
+    GraphEndpointsCalled = make_set(NormalizedRequestUri),
+    RawEndpoints = make_set(RequestUri, 50),  // Keep some raw examples
+    IPAddresses = make_set(IPAddress),
+    UserAgents = make_set(UserAgent),
+    ResponseCodes = make_set(ResponseStatusCode)
+by SignInActivityId, ObjectId, ObjectType
+// Enrich with analysis metadata
+| extend
+    ActivityDurationMinutes = datetime_diff('minute', LastActivity, FirstActivity),
+    UniqueEndpoints = array_length(GraphEndpointsCalled),
+    SuccessRate = round(toreal(SuccessfulCalls) / toreal(TotalCalls) * 100, 1)
+// Calculate suspicion indicators
+| extend
+    SuspicionLevel = case(
+        UniqueEndpoints > 20 and SuccessRate > 80, "Critical",  // Broad enumeration with high success
+        UniqueEndpoints > 10, "High",
+        UniqueEndpoints > 5, "Medium",
+        "Low"
+    ),
+    AnalysisType = "Token-Specific Investigation"
+| project
+    SignInActivityId,
+    ObjectId,
+    ObjectType,
+    FirstActivity,
+    LastActivity,
+    ActivityDurationMinutes,
+    TotalCalls,
+    SuccessfulCalls,
+    FailedCalls,
+    SuccessRate,
+    UniqueEndpoints,
+    IPAddresses,
+    UserAgents,
+    GraphEndpointsCalled,
+    RawEndpoints,
+    ResponseCodes,
+    SuspicionLevel,
+    AnalysisType
+
+// TROUBLESHOOTING:
+// - If no results: Verify targetTokenId is correct and within lookbackPeriod
+// - If results are empty: Check if MicrosoftGraphActivityLogs has data for the time period
+// - To find token IDs: Use other detection queries or SigninLogs correlations
+//
+// EXAMPLE USAGE WORKFLOW:
+// 1. Use broad detection query (e.g., detect_azurehound.kql) to identify suspicious token
+// 2. Copy the SignInActivityId from detection results
+// 3. Replace targetTokenId in this query with the identified token
+// 4. Run this query to get detailed analysis of that specific token's activity
+//
+// INVESTIGATION QUERIES:
+// - Get time-series view of API calls:
+//   MicrosoftGraphActivityLogs
+//   | where SignInActivityId contains "<token_id>"
+//   | summarize CallCount = count() by bin(TimeGenerated, 5m), RequestUri
+//   | render timechart
+// - Identify the authentication event for this token:
+//   SigninLogs
+//   | where CorrelationId == "<token_id>" or Id == "<token_id>"
+//   | project TimeGenerated, UserPrincipalName, AppDisplayName, IPAddress, Location
+// - Check for related tokens from same source:
+//   MicrosoftGraphActivityLogs
+//   | where IPAddress in ("<detected_ip>")
+//   | summarize Tokens = make_set(SignInActivityId), CallCount = count() by UserId
+//
+// FORENSIC NOTES:
+// - SignInActivityId represents a unique token/session
+// - All API calls with the same SignInActivityId used the same access token
+// - Token lifetime is typically 1 hour (default) but can vary
+// - Refresh tokens can be used to generate new access tokens (different IDs)
+// - Look for token acquisition method in SigninLogs (device code, password, etc.)
+//
+// RESPONSE ACTIONS:
+// 1. Document all GraphEndpointsCalled for incident report
+// 2. Assess what sensitive data was accessed
+// 3. Determine if this is reconnaissance only or data exfiltration occurred
+// 4. Check for any privilege escalation attempts
+// 5. Revoke all tokens for the affected user/service principal
+// 6. Review all activity from associated IP addresses
