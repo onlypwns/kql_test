@@ -1,0 +1,233 @@
+// ============================================================================
+// QUERY: Comprehensive PowerShell File Tracking and Content Recovery
+// ============================================================================
+//
+// PURPOSE:
+//   Performs comprehensive tracking of a PowerShell file across multiple
+//   telemetry sources to recover execution traces, script content, and
+//   associated activities even if the file has been deleted.
+//
+// MITRE ATT&CK:
+//   - T1059.001: Command and Scripting Interpreter - PowerShell
+//   - T1027: Obfuscated Files or Information
+//   - T1070.004: Indicator Removal on Host - File Deletion
+//   - T1547: Boot or Logon Autostart Execution
+//
+// THREAT CONTEXT:
+//   Adversaries frequently use PowerShell for post-exploitation activities
+//   and often delete evidence. This query recovers PowerShell script traces
+//   from multiple sources: script block logging, AMSI, process events,
+//   file events, registry persistence, and WMI execution.
+//
+// DATA SOURCES:
+//   - DeviceEvents (PowerShell script blocks, AMSI, WMI)
+//   - DeviceProcessEvents (Execution traces)
+//   - DeviceFileEvents (File operations including deletion)
+//   - DeviceRegistryEvents (Persistence mechanisms)
+//   - Requires: Microsoft Defender for Endpoint or equivalent MDE telemetry
+//
+// CONFIGURATION:
+//   IMPORTANT: Replace the default values below with your investigation targets
+//
+// PERFORMANCE NOTES:
+//   - Estimated execution time: 30-60 seconds for 7 days of data
+//   - Uses union isfuzzy=true for flexibility across schema changes
+//   - Can be resource-intensive for large environments
+//   - Consider reducing timeRange for faster results
+//
+// LAST UPDATED: 2026-01-19
+// VERSION: 2.0
+// ============================================================================
+
+// ============================================================================
+// CONFIGURATION PARAMETERS - CUSTOMIZE THESE FOR YOUR INVESTIGATION
+// ============================================================================
+let deviceName = "workstation1";  // Target device hostname
+let fileName = "malicious.ps1";   // Target PowerShell script filename
+let timeRange = ago(7d);           // Lookback period (extend for deleted files)
+
+// ============================================================================
+// MAIN QUERY LOGIC
+// ============================================================================
+
+// First, get a summary of file operations
+let fileTrace =
+DeviceFileEvents
+| where Timestamp > timeRange
+| where DeviceName =~ deviceName
+| where FileName =~ fileName or FolderPath contains fileName
+| summarize
+    FirstSeen = min(Timestamp),
+    LastSeen = max(Timestamp),
+    FileActions = make_set(ActionType),
+    FilePaths = make_set(FolderPath),
+    FileHashes = make_set(SHA256)
+by DeviceName, FileName;
+
+// Union all possible sources for PowerShell execution and content recovery
+union isfuzzy=true
+// ============================================================================
+// Source 1: PowerShell Script Block Logging
+// ============================================================================
+// This is the primary source for recovering actual script content
+// Requires: PowerShell script block logging enabled (Event ID 4104)
+(DeviceEvents
+| where Timestamp > timeRange
+| where DeviceName =~ deviceName
+| where ActionType == "PowerShellCommand" or ActionType == "ScriptContent"
+| where InitiatingProcessFileName =~ "powershell.exe" or InitiatingProcessFileName =~ "pwsh.exe"
+| extend ScriptContent = parse_json(AdditionalFields)
+// Match based on command line, script content, or identifying keywords
+| where ProcessCommandLine contains fileName
+    or tostring(ScriptContent) contains fileName
+    or tostring(ScriptContent) contains "malicious"  // Adjust keyword as needed
+| extend
+    EventType = "PowerShellScriptBlock",
+    PossibleScriptContent = tostring(ScriptContent.Command),
+    ScriptBlockText = tostring(ScriptContent.ScriptBlockText),
+    ScriptBlockId = tostring(ScriptContent.ScriptBlockId)
+| project Timestamp, DeviceName, EventType, ActionType,
+    FileName = coalesce(FileName, InitiatingProcessFileName),
+    ProcessCommandLine, InitiatingProcessCommandLine,
+    PossibleScriptContent, ScriptBlockText, ScriptBlockId, AdditionalFields
+),
+// ============================================================================
+// Source 2: AMSI (Anti-Malware Scan Interface) Events
+// ============================================================================
+// AMSI can capture script content that was scanned by antimalware
+// Often contains full or partial script content
+(DeviceEvents
+| where Timestamp > timeRange
+| where DeviceName =~ deviceName
+| where ActionType in ("AmsiScriptContent", "AntiMalwareScanContent", "BehaviorDetected")
+| extend ParsedFields = parse_json(AdditionalFields)
+// Match based on command line or content
+| where ProcessCommandLine contains fileName
+    or InitiatingProcessCommandLine contains fileName
+    or tostring(ParsedFields) contains fileName
+| extend
+    EventType = "AMSIEvent",
+    ScriptContent = tostring(ParsedFields.ScriptContent),
+    ThreatName = tostring(ParsedFields.ThreatName)
+| project Timestamp, DeviceName, EventType, ActionType,
+    FileName = coalesce(FileName, InitiatingProcessFileName),
+    ProcessCommandLine, InitiatingProcessCommandLine,
+    ScriptContent, ThreatName, AdditionalFields
+),
+// ============================================================================
+// Source 3: Process Execution Events
+// ============================================================================
+// Captures PowerShell process creation and command line parameters
+// Can decode base64-encoded commands
+(DeviceProcessEvents
+| where Timestamp > timeRange
+| where DeviceName =~ deviceName
+| where ProcessCommandLine contains fileName
+    or ProcessCommandLine contains fileName  // Check both direct reference
+    or (FileName in~ ("powershell.exe", "pwsh.exe") and ProcessCommandLine contains fileName)
+    or ProcessCommandLine matches regex @"(?i)powershell.*-enc.*"  // Encoded commands
+    or ProcessCommandLine matches regex @"(?i)powershell.*-e\s+"    // Shortened encoded flag
+| extend
+    EventType = "ProcessExecution",
+    // Attempt to decode base64-encoded PowerShell commands
+    DecodedCommand = iff(
+        ProcessCommandLine matches regex @"(?i)-enc(oded)?\s+([A-Za-z0-9+/=]+)",
+        base64_decode_tostring(extract(@"(?i)-enc(?:oded)?\s+([A-Za-z0-9+/=]+)", 1, ProcessCommandLine)),
+        "")
+| project Timestamp, DeviceName, EventType, ActionType = "ProcessCreated",
+    FileName, FolderPath, ProcessId, InitiatingProcessId,
+    ProcessCommandLine, InitiatingProcessCommandLine,
+    DecodedCommand, SHA256
+),
+// ============================================================================
+// Source 4: File Events (Including Deletion)
+// ============================================================================
+// Tracks file operations: creation, modification, and deletion
+// Critical for timeline reconstruction
+(DeviceFileEvents
+| where Timestamp > timeRange
+| where DeviceName =~ deviceName
+| where FileName =~ fileName or FolderPath contains fileName
+| extend
+    EventType = case(
+        ActionType == "FileDeleted", "FileDeletion",
+        ActionType == "FileModified", "FileModification",
+        ActionType == "FileCreated", "FileCreation",
+        "FileOperation"),
+    WasDeleted = iff(ActionType == "FileDeleted", true, false)
+| project Timestamp, DeviceName, EventType, ActionType,
+    FileName, FolderPath, InitiatingProcessFileName,
+    InitiatingProcessCommandLine, SHA256, WasDeleted, FileSize
+),
+// ============================================================================
+// Source 5: Registry Persistence Mechanisms
+// ============================================================================
+// Detects PowerShell persistence via registry modifications
+// Common locations: Run keys, scheduled tasks, WMI subscriptions
+(DeviceRegistryEvents
+| where Timestamp > timeRange
+| where DeviceName =~ deviceName
+| where InitiatingProcessFileName in~ ("powershell.exe", "pwsh.exe")
+    or RegistryValueData contains fileName
+    or (RegistryValueData contains "powershell" and RegistryValueData contains fileName)
+| extend EventType = "RegistryPersistence"
+| project Timestamp, DeviceName, EventType, ActionType,
+    FileName = InitiatingProcessFileName,
+    RegistryKey, RegistryValueName, RegistryValueData,
+    InitiatingProcessCommandLine
+),
+// ============================================================================
+// Source 6: WMI Event Consumer Execution
+// ============================================================================
+// Detects PowerShell execution via WMI event consumers
+// Common technique for persistence and evasion
+(DeviceEvents
+| where Timestamp > timeRange
+| where DeviceName =~ deviceName
+| where ActionType in ("WmiBindEventFilterToConsumer", "WmiConsumerCreated", "WmiFilterCreated")
+| extend ParsedFields = parse_json(AdditionalFields)
+| where tostring(ParsedFields) contains "powershell" and tostring(ParsedFields) contains fileName
+| extend
+    EventType = "WMIExecution",
+    WMICommand = tostring(ParsedFields.CommandLine)
+| project Timestamp, DeviceName, EventType, ActionType,
+    FileName = InitiatingProcessFileName,
+    WMICommand, AdditionalFields
+)
+// ============================================================================
+// POST-PROCESSING AND TIMELINE CONSTRUCTION
+// ============================================================================
+| sort by Timestamp asc
+// Calculate time difference between consecutive events
+| extend TimeSinceLastEvent = datetime_diff('second', Timestamp, prev(Timestamp))
+// Add sequential event numbering for timeline analysis
+| extend EventNumber = row_number()
+
+// ============================================================================
+// TROUBLESHOOTING
+// ============================================================================
+// - If no results: Check deviceName and fileName are correct
+// - If file was deleted: Extend timeRange (e.g., ago(30d))
+// - If partial results: Check if required logging is enabled:
+//   * Script block logging: GPO or Set-ItemProperty HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging
+//   * AMSI: Enabled by default on Windows 10+
+//   * Process creation: Defender for Endpoint required
+//
+// EXAMPLE INVESTIGATION WORKFLOWS:
+// 1. Identify when file first appeared: Look for "FileCreation" EventType
+// 2. Find script content: Look for "PowerShellScriptBlock" or "AMSIEvent" EventType
+// 3. Determine if deleted: Look for "FileDeletion" EventType with WasDeleted = true
+// 4. Check persistence: Look for "RegistryPersistence" or "WMIExecution" EventType
+// 5. Decode obfuscation: Check DecodedCommand field for base64-decoded commands
+//
+// FOLLOW-UP QUERIES:
+// - Get all PowerShell execution from the same user:
+//   DeviceProcessEvents
+//   | where DeviceName == "<device>"
+//   | where InitiatingProcessAccountName == "<user_from_results>"
+//   | where FileName in~ ("powershell.exe", "pwsh.exe")
+// - Check for network connections from PowerShell:
+//   DeviceNetworkEvents
+//   | where DeviceName == "<device>"
+//   | where InitiatingProcessFileName in~ ("powershell.exe", "pwsh.exe")
+//   | where Timestamp between (datetime(<first_seen>) .. datetime(<last_seen>))

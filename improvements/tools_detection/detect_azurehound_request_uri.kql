@@ -1,0 +1,167 @@
+// ============================================================================
+// QUERY: AzureHound Detection via Request URI Pattern Frequency Analysis
+// ============================================================================
+//
+// PURPOSE:
+//   Detects AzureHound activity by analyzing the frequency of normalized
+//   Microsoft Graph API endpoint patterns. AzureHound makes repetitive calls
+//   to specific endpoints, creating a distinctive frequency distribution.
+//
+// MITRE ATT&CK:
+//   - T1087.004: Account Discovery - Cloud Account
+//   - T1069.003: Permission Groups Discovery - Cloud Groups
+//   - T1526: Cloud Service Discovery
+//
+// THREAT CONTEXT:
+//   AzureHound performs systematic enumeration by making many calls to the
+//   same API endpoint patterns (e.g., /users, /groups/<id>/members,
+//   /roleAssignments). By normalizing URIs and analyzing frequency, we can
+//   identify enumeration patterns distinct from normal administrative activity.
+//
+// DATA SOURCE:
+//   - MicrosoftGraphActivityLogs
+//   - Requires: Microsoft 365 E5 or Microsoft Entra ID P2 license
+//
+// DETECTION METHOD:
+//   1. Filters for "azurehound" UserAgent (baseline detection)
+//   2. Normalizes RequestUri by removing UUIDs and query parameters
+//   3. Counts frequency of each normalized endpoint pattern
+//   4. Identifies most commonly accessed endpoints
+//
+// RECOMMENDATIONS:
+//   - Review top endpoints to understand enumeration scope
+//   - Cross-reference with other AzureHound detection queries
+//   - Investigate users/service principals making these calls
+//   - Use frequency analysis to refine detection rules
+//
+// PERFORMANCE NOTES:
+//   - Estimated execution time: 5-10 seconds for 3 days of data
+//   - Regex operations are computationally expensive
+//   - Limit time range for large environments
+//
+// KNOWN FALSE POSITIVES:
+//   - Authorized penetration testing or red team engagements
+//   - Security assessment tools using AzureHound
+//   - Rate: Very Low (should be investigated every time)
+//
+// LAST UPDATED: 2026-01-19
+// VERSION: 2.0
+// ============================================================================
+
+// Configuration Parameters
+let lookbackPeriod = 3d;  // Adjust based on investigation needs
+let topEndpointsCount = 20;  // Number of top endpoints to display
+
+// Main Detection Logic
+MicrosoftGraphActivityLogs
+| where TimeGenerated >= ago(lookbackPeriod)
+// Baseline filter for AzureHound UserAgent
+| where UserAgent contains "azurehound"
+// Enrich with object identification
+| extend
+    ObjectId = iff(isempty(UserId), ServicePrincipalId, UserId),
+    ObjectType = iff(isempty(UserId), "ServicePrincipal", "User")
+// Normalize RequestUri - Remove UUIDs (e.g., user IDs, group IDs, app IDs)
+// Note: The regex pattern uses \b for word boundary instead of forward slash to match patterns more accurately
+| extend NormalizedRequestUri = replace_regex(
+    RequestUri,
+    @'/[0-9a-fA-F]{8}\b-[0-9a-fA-F]{4}\b-[0-9a-fA-F]{4}\b-[0-9a-fA-F]{4}\b-[0-9a-fA-F]{12}/',
+    '/APPID/'
+)
+// Remove roleAssignments query parameters (often used in enumeration)
+| extend NormalizedRequestUri = replace_regex(
+    NormalizedRequestUri,
+    @'/roleAssignments\?.*$',
+    '/roleAssignments'
+)
+// Remove all remaining query parameters to focus on endpoint structure
+| extend NormalizedRequestUri = replace_regex(NormalizedRequestUri, @'\?.*$', '')
+// Count frequency of each normalized endpoint pattern
+| summarize
+    CallCount = count(),
+    UniqueUsers = dcount(ObjectId),
+    IPAddresses = make_set(IPAddress),
+    FirstSeen = min(TimeGenerated),
+    LastSeen = max(TimeGenerated),
+    ResponseCodes = make_set(ResponseStatusCode),
+    ExampleRawUri = any(RequestUri)  // Keep one example of the actual URI
+by NormalizedRequestUri
+// Sort by frequency to identify most targeted endpoints
+| sort by CallCount desc
+// Limit to top N endpoints
+| take topEndpointsCount
+// Enrich with analysis metadata
+| extend
+    RiskIndicator = "AzureHound Endpoint Pattern Detected",
+    Severity = case(
+        CallCount > 1000, "Critical",
+        CallCount > 500, "High",
+        CallCount > 100, "Medium",
+        "Low"
+    ),
+    EnumerationIntensity = case(
+        CallCount > 1000, "Very High",
+        CallCount > 500, "High",
+        CallCount > 100, "Medium",
+        "Low"
+    )
+| project
+    Rank = row_number(),
+    NormalizedRequestUri,
+    CallCount,
+    UniqueUsers,
+    EnumerationIntensity,
+    FirstSeen,
+    LastSeen,
+    IPAddresses,
+    ResponseCodes,
+    ExampleRawUri,
+    RiskIndicator,
+    Severity
+
+// TROUBLESHOOTING:
+// - If no results: Check if "azurehound" UserAgent is present in logs
+// - If too many results: Reduce topEndpointsCount or increase time range
+// - To analyze specific endpoint: Filter by NormalizedRequestUri in follow-up query
+//
+// EXAMPLE INVESTIGATION QUERIES:
+// - Get detailed activity for a specific endpoint pattern:
+//   MicrosoftGraphActivityLogs
+//   | where UserAgent contains "azurehound"
+//   | extend NormalizedUri = replace_regex(RequestUri, @'[0-9a-fA-F-]+', '<ID>')
+//   | where NormalizedUri == "<specific_pattern>"
+//   | summarize count() by bin(TimeGenerated, 5m), UserId
+//   | render timechart
+// - Identify all unique users involved:
+//   MicrosoftGraphActivityLogs
+//   | where UserAgent contains "azurehound"
+//   | summarize
+//       CallCount = count(),
+//       Endpoints = dcount(RequestUri)
+//   by UserId, ServicePrincipalId, IPAddress
+// - Map to MITRE ATT&CK based on endpoints:
+//   - /users, /groups -> T1087.004 (Account Discovery)
+//   - /roleAssignments, /directoryRoles -> T1069.003 (Permission Discovery)
+//   - /servicePrincipals, /applications -> T1526 (Cloud Service Discovery)
+//
+// ANALYSIS NOTES:
+// Common AzureHound endpoint patterns and their purpose:
+// - /v1.0/users -> Enumerate all users
+// - /v1.0/groups -> Enumerate all groups
+// - /v1.0/groups/<ID>/members -> Get group membership
+// - /v1.0/servicePrincipals -> Enumerate service principals
+// - /v1.0/applications -> Enumerate applications
+// - /v1.0/directoryRoles -> Enumerate directory roles
+// - /v1.0/directoryRoles/<ID>/members -> Get role members
+// - /v1.0/roleManagement/directory/roleAssignments -> Get role assignments
+// - /beta/devices -> Enumerate devices
+// - /beta/servicePrincipals/<ID>/appRoleAssignedTo -> Get app role assignments
+//
+// RESPONSE ACTIONS:
+// 1. Document all endpoint patterns accessed for incident report
+// 2. Assess what data was enumerated based on endpoint patterns
+// 3. Identify the user/service principal making these calls
+// 4. Revoke all active sessions and tokens
+// 5. Review for any privilege escalation or configuration changes
+// 6. Check if this is authorized security testing
+// 7. Implement detection rules for similar patterns without UserAgent dependency

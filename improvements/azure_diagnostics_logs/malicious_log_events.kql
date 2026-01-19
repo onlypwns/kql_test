@@ -1,0 +1,231 @@
+// ============================================================================
+// QUERY: Azure SQL Database Error Monitoring
+// ============================================================================
+//
+// PURPOSE:
+//   Monitors Azure SQL Database error logs to detect potential security issues,
+//   SQL injection attempts, unauthorized access attempts, and database
+//   configuration problems.
+//
+// MITRE ATT&CK:
+//   - T1190: Exploit Public-Facing Application
+//   - T1505.001: Server Software Component - SQL Stored Procedures
+//   - T1213.002: Data from Information Repositories - Database
+//   - T1485: Data Destruction
+//
+// THREAT CONTEXT:
+//   Azure SQL Database errors can indicate security issues including SQL
+//   injection attempts, authentication failures, permission violations, or
+//   database integrity problems. Monitoring these errors helps detect both
+//   attacks in progress and misconfigurations that could lead to security issues.
+//
+// DATA SOURCE:
+//   - AzureDiagnostics (Azure SQL Database diagnostic logs)
+//   - Requires: Azure SQL Database with diagnostic settings enabled
+//
+// DETECTION METHOD:
+//   Filters diagnostic logs for SQL Server database error events to identify
+//   security-relevant issues.
+//
+// RECOMMENDATIONS:
+//   - Alert on repeated authentication failures
+//   - Investigate SQL syntax errors (potential injection attempts)
+//   - Review permission denied errors for unauthorized access
+//   - Monitor for unusual error patterns or spikes
+//   - Enable Advanced Threat Protection for Azure SQL
+//
+// PERFORMANCE NOTES:
+//   - Estimated execution time: < 5 seconds for 7 days of data
+//   - Very efficient with specific filters
+//   - Suitable for real-time alerting
+//
+// KNOWN FALSE POSITIVES:
+//   - Application bugs or misconfigurations
+//   - Legitimate permission issues during normal operations
+//   - Development/testing activities
+//   - Rate: Medium (10-20% without application context)
+//
+// LAST UPDATED: 2026-01-19
+// VERSION: 2.0
+// ============================================================================
+
+// Configuration Parameters
+let lookbackPeriod = 7d;  // Time window for analysis
+let minErrorCount = 5;     // Minimum errors to flag for investigation
+
+// Main Detection Logic
+AzureDiagnostics
+| where TimeGenerated >= ago(lookbackPeriod)
+// Filter to Azure SQL Database resources
+| where ResourceType == "SERVERS/DATABASES"
+| where ResourceProvider == "MICROSOFT.SQL"
+// Focus on error events
+| where Category == "Errors"
+// ============================================================================
+// ENRICH WITH ERROR CLASSIFICATION
+// ============================================================================
+| extend
+    // Classify error severity and type
+    ErrorSeverity = case(
+        Message contains "login failed" or Message contains "authentication", "High - Auth Failure",
+        Message contains "permission denied" or Message contains "access denied", "High - Access Denied",
+        Message contains "syntax error" or Message contains "invalid", "Medium - SQL Syntax Error",
+        Message contains "deadlock" or Message contains "timeout", "Medium - Performance Issue",
+        Message contains "corruption" or Message contains "integrity", "Critical - Data Integrity",
+        "Low - General Error"
+    ),
+    // Detect potential security issues
+    PotentialThreat = case(
+        Message contains "DROP TABLE" or Message contains "DROP DATABASE", "Data Destruction Attempt",
+        Message contains "xp_cmdshell" or Message contains "sp_execute", "Command Execution Attempt",
+        Message contains "UNION SELECT" or Message contains "OR 1=1", "SQL Injection Pattern",
+        Message contains "exec(" or Message contains "execute(", "Dynamic SQL Execution",
+        "None Detected"
+    ),
+    // Extract error details if available
+    ErrorNumber = extract(@"Error:\s*(\d+)", 1, Message),
+    ErrorMessage = Message
+// Summarize by resource and error type for pattern analysis
+| summarize
+    ErrorCount = count(),
+    FirstOccurrence = min(TimeGenerated),
+    LastOccurrence = max(TimeGenerated),
+    UniqueMessages = make_set(Message, 10),  // Keep up to 10 unique messages
+    CallerIPs = make_set(CallerIpAddress),
+    ErrorNumbers = make_set(ErrorNumber)
+by Resource, ResourceGroup, ErrorSeverity, PotentialThreat
+// Filter to significant error patterns
+| where ErrorCount >= minErrorCount or PotentialThreat != "None Detected"
+// ============================================================================
+// RISK SCORING
+// ============================================================================
+| extend
+    RiskScore = case(
+        PotentialThreat != "None Detected", "Critical",
+        ErrorSeverity contains "Critical", "Critical",
+        ErrorSeverity contains "High", "High",
+        ErrorCount > 50, "High",
+        ErrorCount > 20, "Medium",
+        "Low"
+    ),
+    RiskIndicator = iff(
+        PotentialThreat != "None Detected",
+        strcat("SQL Security Issue: ", PotentialThreat),
+        strcat("SQL Error Pattern: ", ErrorSeverity)
+    )
+// ============================================================================
+// OUTPUT
+// ============================================================================
+| project
+    FirstOccurrence,
+    LastOccurrence,
+    DatabaseName = Resource,
+    ResourceGroup,
+    ErrorCount,
+    ErrorSeverity,
+    PotentialThreat,
+    RiskScore,
+    RiskIndicator,
+    UniqueMessages,
+    ErrorNumbers,
+    CallerIPs
+| sort by RiskScore desc, ErrorCount desc
+
+// ============================================================================
+// TROUBLESHOOTING
+// ============================================================================
+// - If no results: Good! No significant SQL errors detected
+// - If too many results: Increase minErrorCount or focus on specific error types
+// - If missing expected errors: Check diagnostic settings are enabled
+//
+// ENABLE DIAGNOSTIC SETTINGS:
+// Azure Portal > SQL Database > Monitoring > Diagnostic settings
+// Enable categories:
+// - Errors
+// - QueryStoreRuntimeStatistics (optional, for performance)
+// - Timeouts (optional)
+// - Blocks (optional)
+//
+// EXAMPLE INVESTIGATION WORKFLOWS:
+// 1. SQL Injection investigation:
+//    - Filter for PotentialThreat containing "SQL Injection"
+//    - Review UniqueMessages for attack patterns
+//    - Check CallerIPs for source attribution
+// 2. Authentication issue analysis:
+//    - Filter for ErrorSeverity = "High - Auth Failure"
+//    - High error count may indicate brute force or credential spray
+// 3. Data integrity concerns:
+//    - Filter for ErrorSeverity = "Critical - Data Integrity"
+//    - Immediate investigation required
+//
+// FOLLOW-UP QUERIES:
+// - Get detailed error logs for specific database:
+//   AzureDiagnostics
+//   | where Resource == "<database_name>"
+//   | where Category == "Errors"
+//   | where TimeGenerated >= ago(7d)
+//   | project TimeGenerated, Message, CallerIpAddress
+//   | sort by TimeGenerated desc
+//
+// - Analyze authentication failures by source IP:
+//   AzureDiagnostics
+//   | where ResourceType == "SERVERS/DATABASES"
+//   | where Category == "Errors"
+//   | where Message contains "login failed"
+//   | summarize FailureCount = count(), Databases = make_set(Resource)
+//              by CallerIpAddress
+//   | sort by FailureCount desc
+//
+// - Check for SQL injection patterns:
+//   AzureDiagnostics
+//   | where ResourceType == "SERVERS/DATABASES"
+//   | where Category == "Errors"
+//   | where Message matches regex @"(?i)(union select|or 1=1|drop table|xp_cmdshell)"
+//   | project TimeGenerated, Resource, Message, CallerIpAddress
+//
+// - Monitor error trends over time:
+//   AzureDiagnostics
+//   | where ResourceType == "SERVERS/DATABASES"
+//   | where Category == "Errors"
+//   | summarize ErrorCount = count() by bin(TimeGenerated, 1h), Resource
+//   | render timechart
+//
+// RESPONSE ACTIONS:
+// 1. **CRITICAL** (RiskScore = "Critical"):
+//    - Isolate affected database if data destruction or SQLi confirmed
+//    - Review recent query logs for attack details
+//    - Check for data exfiltration or modification
+//    - Block malicious source IPs at firewall level
+// 2. **HIGH** (Repeated authentication failures):
+//    - Implement IP-based firewall rules
+//    - Review and rotate credentials
+//    - Enable Azure AD authentication
+//    - Configure alerts for failed login attempts
+// 3. **INVESTIGATION**:
+//    - Review application logs for error context
+//    - Check for correlating security events
+//    - Document error patterns for root cause analysis
+// 4. **PREVENTION**:
+//    - Enable Advanced Threat Protection for Azure SQL
+//    - Implement parameterized queries in applications
+//    - Use least-privilege database access
+//    - Enable SQL Server Auditing
+//    - Configure vulnerability assessments
+//
+// COMMON SQL ERROR NUMBERS TO INVESTIGATE:
+// - 18456: Login failed (authentication issue)
+// - 229: Permission denied (authorization issue)
+// - 102: Syntax error (potential SQL injection)
+// - 1205: Deadlock victim (performance/locking issue)
+// - 2627: Duplicate key violation
+// - 547: Foreign key constraint violation
+//
+// AZURE SQL SECURITY BEST PRACTICES:
+// - Enable Advanced Threat Protection
+// - Use Azure AD authentication
+// - Implement Private Link for network isolation
+// - Enable transparent data encryption (TDE)
+// - Configure audit logs and retention
+// - Use Always Encrypted for sensitive data
+// - Implement dynamic data masking
+// - Regular vulnerability assessments

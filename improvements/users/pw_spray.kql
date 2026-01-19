@@ -1,0 +1,219 @@
+// ============================================================================
+// QUERY: Password Spray Attack Detection
+// ============================================================================
+//
+// PURPOSE:
+//   Detects potential password spray attacks by identifying patterns of
+//   failed authentication attempts across multiple users, potentially from
+//   the same source IP or targeting the same application.
+//
+// MITRE ATT&CK:
+//   - T1110.003: Brute Force - Password Spraying
+//   - T1078: Valid Accounts
+//   - T1586: Compromise Accounts
+//
+// THREAT CONTEXT:
+//   Password spraying is a technique where attackers attempt to access many
+//   accounts with commonly used passwords, avoiding account lockout by
+//   limiting attempts per account. This is a common initial access vector
+//   for cloud environments.
+//
+// DATA SOURCE:
+//   - SigninLogs
+//   - Requires: Azure AD Premium P1 or P2 license
+//
+// DETECTION METHOD:
+//   Identifies patterns of failed authentication attempts across multiple
+//   users, analyzing by time windows, source IPs, and targeted resources.
+//
+// RECOMMENDATIONS:
+//   - Alert on unusual patterns of failed logins
+//   - Investigate source IP addresses with high failure rates
+//   - Review targeted user accounts for weak passwords
+//   - Enable account lockout policies and risk-based access controls
+//   - Consider blocking suspicious IP addresses
+//
+// PERFORMANCE NOTES:
+//   - Estimated execution time: 10-15 seconds for 24 hours of data
+//   - Extend lookback period for historical analysis
+//   - Summarization may be resource-intensive in large environments
+//
+// KNOWN FALSE POSITIVES:
+//   - Misconfigured applications or services
+//   - Users forgetting passwords after password changes
+//   - SSO integration issues
+//   - Rate: Medium (10-15% without tuning)
+//
+// LAST UPDATED: 2026-01-19
+// VERSION: 2.0
+// ============================================================================
+
+// Configuration Parameters
+let lookbackPeriod = 24h;  // Time window for analysis
+let minFailedAttempts = 5;  // Minimum failed attempts to flag
+let minAffectedUsers = 3;   // Minimum number of users affected from same source
+
+// Main Detection Logic
+SigninLogs
+// Filter to failed sign-ins only (ResultType != 0 indicates failure)
+| where ResultType != 0
+| where TimeGenerated >= ago(lookbackPeriod)
+// Enrich with failure details
+| extend
+    FailureReason = ResultDescription,
+    TargetResource = ResourceDisplayName,
+    IsPasswordError = iff(
+        ResultType in ("50126", "50055", "50053"),  // Common password error codes
+        true,
+        false
+    )
+// Summarize failures by key dimensions to identify spray patterns
+| summarize
+    FailedLoginCount = count(),
+    AffectedUsers = make_set(UserPrincipalName),
+    UniqueUsers = dcount(UserPrincipalName),
+    ErrorCodes = make_set(ResultType),
+    FailureReasons = make_set(ResultDescription),
+    TargetedApps = make_set(AppDisplayName),
+    FirstAttempt = min(TimeGenerated),
+    LastAttempt = max(TimeGenerated),
+    Locations = make_set(Location),
+    UserAgents = make_set(UserAgent)
+by ResourceDisplayName, IPAddress, bin(TimeGenerated, 1h)  // Group by hour and source
+// Filter to potential password spray indicators
+| where FailedLoginCount >= minFailedAttempts
+    or UniqueUsers >= minAffectedUsers
+// Calculate attack characteristics
+| extend
+    TimeSpanMinutes = datetime_diff('minute', LastAttempt, FirstAttempt),
+    AttackRate = round(toreal(FailedLoginCount) / toreal(datetime_diff('minute', LastAttempt, FirstAttempt) + 1), 2),
+    // Risk scoring based on multiple factors
+    RiskScore = case(
+        UniqueUsers >= 10 and FailedLoginCount >= 50, "Critical",
+        UniqueUsers >= 5 and FailedLoginCount >= 20, "High",
+        UniqueUsers >= minAffectedUsers or FailedLoginCount >= 10, "Medium",
+        "Low"
+    ),
+    AttackPattern = case(
+        UniqueUsers >= 10, "Wide Spray (10+ accounts)",
+        UniqueUsers >= 5, "Moderate Spray (5-9 accounts)",
+        "Targeted Spray (2-4 accounts)"
+    )
+// Enrich with indicators
+| extend
+    RiskIndicator = "Potential Password Spray Attack",
+    SuspicionLevel = case(
+        RiskScore in ("Critical", "High"), "High Confidence",
+        "Medium Confidence"
+    )
+// Final output
+| project
+    TimeWindow = TimeGenerated,
+    FirstAttempt,
+    LastAttempt,
+    SourceIPAddress = IPAddress,
+    TargetedResource = ResourceDisplayName,
+    FailedLoginCount,
+    UniqueUsers,
+    AffectedUsers,
+    AttackPattern,
+    TimeSpanMinutes,
+    AttackRate,
+    RiskScore,
+    RiskIndicator,
+    SuspicionLevel,
+    ErrorCodes,
+    FailureReasons,
+    TargetedApps,
+    Locations,
+    UserAgents
+| sort by RiskScore desc, FailedLoginCount desc
+
+// ============================================================================
+// TROUBLESHOOTING
+// ============================================================================
+// - If no results: No password spray patterns detected (good!)
+// - If too many results: Increase minFailedAttempts or minAffectedUsers
+// - If missing expected attacks: Decrease thresholds or extend lookbackPeriod
+//
+// TUNE DETECTION THRESHOLDS:
+// - Aggressive: minFailedAttempts = 3, minAffectedUsers = 2
+// - Balanced (default): minFailedAttempts = 5, minAffectedUsers = 3
+// - Conservative: minFailedAttempts = 10, minAffectedUsers = 5
+//
+// EXAMPLE INVESTIGATION WORKFLOWS:
+// 1. Validate attack:
+//    - Review AffectedUsers list for pattern (random users vs targeted)
+//    - Check FailureReasons for password errors vs other issues
+//    - Verify SourceIPAddress is external and not internal infrastructure
+// 2. Assess impact:
+//    - Check if any attempts succeeded after failures
+//    - Use follow-up query to find successful logins from same IP
+// 3. Scope determination:
+//    - Review TimeSpanMinutes and AttackRate for attack velocity
+//    - Check Locations and UserAgents for additional context
+//
+// FOLLOW-UP QUERIES:
+// - Check for successful logins from the suspicious IP:
+//   SigninLogs
+//   | where IPAddress == "<suspicious_ip>"
+//   | where TimeGenerated >= ago(24h)
+//   | where ResultType == "0"  // Successful
+//   | project TimeGenerated, UserPrincipalName, AppDisplayName, Location
+//   | sort by TimeGenerated desc
+//
+// - Get full timeline of all attempts from suspicious IP:
+//   SigninLogs
+//   | where IPAddress == "<suspicious_ip>"
+//   | where TimeGenerated >= ago(7d)
+//   | project TimeGenerated, UserPrincipalName, ResultType, ResultDescription
+//   | sort by TimeGenerated asc
+//
+// - Check if affected users later had successful suspicious logins:
+//   SigninLogs
+//   | where UserPrincipalName in ("<affected_user_list>")
+//   | where TimeGenerated >= ago(7d)
+//   | where RiskLevelDuringSignIn in ("high", "medium")
+//   | project TimeGenerated, UserPrincipalName, IPAddress, Location, RiskDetail
+//
+// - Analyze geographic distribution of attacks:
+//   SigninLogs
+//   | where ResultType != 0
+//   | where TimeGenerated >= ago(24h)
+//   | summarize FailureCount = count() by Location, IPAddress
+//   | sort by FailureCount desc
+//
+// RESPONSE ACTIONS:
+// 1. **IMMEDIATE** (for Critical/High risk):
+//    - Block source IP via Conditional Access or firewall
+//    - Enable temporary account lockout if not already configured
+//    - Force MFA re-registration for affected users
+// 2. **URGENT**:
+//    - Review all affected users for successful logins after spray
+//    - Check for any privilege escalation or suspicious activities
+//    - Consider forcing password reset for high-value targets
+// 3. **INVESTIGATION**:
+//    - Collect threat intelligence on source IP
+//    - Document attack timeline and affected accounts
+//    - Check for similar attacks from related IPs or ASNs
+// 4. **PREVENTION**:
+//    - Enable Azure AD Smart Lockout (automatically blocks spray attempts)
+//    - Implement Conditional Access policies requiring MFA
+//    - Enable Azure AD Password Protection (blocks common passwords)
+//    - Configure risk-based access policies in Identity Protection
+//
+// COMMON RESULT CODES FOR PASSWORD SPRAY:
+// - 50126: Invalid username or password (correct format, wrong creds)
+// - 50055: Password is expired
+// - 50053: Account locked (triggered after spray detection)
+// - 50057: User account is disabled
+// - 50034: User account not found (invalid username)
+//
+// MITIGATION STRATEGIES:
+// - Enable Azure AD Smart Lockout
+// - Configure banned password lists
+// - Require MFA for all users
+// - Implement Conditional Access policies
+// - Enable sign-in risk-based access controls
+// - Use passwordless authentication (Windows Hello, FIDO2)
+// - Monitor for leaked credentials via Identity Protection

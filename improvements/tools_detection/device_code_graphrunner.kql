@@ -1,0 +1,112 @@
+// ============================================================================
+// QUERY: Device Code Flow Sign-In to Microsoft Graph Detection
+// ============================================================================
+//
+// PURPOSE:
+//   Detects device code authentication flows targeting Microsoft Graph API,
+//   which can be abused by tools like GraphRunner for initial access or
+//   token phishing attacks.
+//
+// MITRE ATT&CK:
+//   - T1078: Valid Accounts
+//   - T1528: Steal Application Access Token
+//   - T1566.002: Phishing - Spearphishing Link
+//
+// THREAT CONTEXT:
+//   Device code flow is an OAuth 2.0 authentication method designed for
+//   input-constrained devices. Attackers abuse this by tricking users into
+//   authenticating at a link, granting the attacker's application access.
+//   GraphRunner is a post-exploitation toolset that commonly uses device
+//   code flow for initial token acquisition.
+//
+// DATA SOURCE:
+//   - SigninLogs
+//   - Requires: Azure AD Premium P1 or P2 license
+//
+// DETECTION METHOD:
+//   Identifies sign-ins using device code authentication protocol that
+//   successfully accessed Microsoft Graph API.
+//
+// RECOMMENDATIONS:
+//   - Alert on all device code authentications (unless explicitly expected)
+//   - Investigate the user account and determine if authentication was legitimate
+//   - Review user awareness of device code phishing attacks
+//   - Check for subsequent suspicious Graph API activity
+//   - Consider blocking device code flow via Conditional Access if not required
+//
+// PERFORMANCE NOTES:
+//   - Estimated execution time: < 5 seconds for 30 days of data
+//   - Very efficient query with simple filters
+//   - Suitable for real-time alerting
+//
+// KNOWN FALSE POSITIVES:
+//   - Legitimate use of CLI tools (Azure CLI, PowerShell Az module)
+//   - IoT devices or smart displays authenticating to Microsoft services
+//   - Developer testing with device code flow
+//   - Rate: Low-Medium (depends on organizational tooling)
+//
+// LAST UPDATED: 2026-01-19
+// VERSION: 2.0
+// ============================================================================
+
+// Configuration Parameters
+let lookbackPeriod = 30d;  // Adjust based on retention and investigation needs
+let focusOnSuccessfulAuth = true;  // Set to false to include failed attempts
+
+// Main Detection Logic
+SigninLogs
+| where TimeGenerated >= ago(lookbackPeriod)
+// Filter to device code authentication protocol
+| where AuthenticationProtocol == "deviceCode"
+// Focus on Microsoft Graph access (common attack target)
+| where ResourceDisplayName == "Microsoft Graph"
+// Optional: Filter to successful authentications only
+| where focusOnSuccessfulAuth == false or ResultType == "0"
+// Enrich with risk indicators
+| extend
+    RiskIndicator = "Device Code Flow to Microsoft Graph",
+    Severity = case(
+        ConditionalAccessStatus == "failure", "Critical",  // Bypassed CA policies
+        RiskLevelDuringSignIn == "high", "High",
+        "Medium"
+    ),
+    AuthenticationSuccess = iff(ResultType == "0", "Success", "Failed")
+| project
+    TimeGenerated,
+    UserPrincipalName,
+    AuthenticationProtocol,
+    ResourceDisplayName,
+    AppDisplayName,
+    IPAddress,
+    Location,
+    DeviceDetail,
+    ResultDescription,
+    AuthenticationSuccess,
+    ConditionalAccessStatus,
+    RiskLevelDuringSignIn,
+    RiskIndicator,
+    Severity,
+    CorrelationId
+| sort by TimeGenerated desc
+
+// TROUBLESHOOTING:
+// - If no results: Check if SigninLogs table exists and has recent data
+// - If too many results: Filter by specific users or applications
+// - To analyze patterns: Add | summarize count() by UserPrincipalName, bin(TimeGenerated, 1d)
+//
+// EXAMPLE INVESTIGATION QUERIES:
+// - Check for subsequent Graph API activity from flagged user:
+//   MicrosoftGraphActivityLogs
+//   | where UserId == "<detected_user_id>"
+//   | where TimeGenerated > datetime(<detection_time>)
+// - Identify all users affected by device code phishing campaign:
+//   SigninLogs
+//   | where AuthenticationProtocol == "deviceCode"
+//   | where AppDisplayName == "<suspicious_app>"
+//   | summarize Users = make_set(UserPrincipalName) by AppId
+//
+// MITIGATION:
+// - Block device code flow via Conditional Access:
+//   https://learn.microsoft.com/entra/identity/conditional-access/concept-authentication-flows
+// - Enable continuous access evaluation (CAE) for Graph API
+// - Train users to recognize device code phishing attempts

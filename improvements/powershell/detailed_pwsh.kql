@@ -1,0 +1,217 @@
+// ============================================================================
+// QUERY: PowerShell Transcription and Operational Log Recovery
+// ============================================================================
+//
+// PURPOSE:
+//   Recovers PowerShell script content from transcription logs and operational
+//   events. Provides an alternative recovery method focusing on transcription
+//   data and event logs when script block logging may be incomplete or disabled.
+//
+// MITRE ATT&CK:
+//   - T1059.001: Command and Scripting Interpreter - PowerShell
+//   - T1027: Obfuscated Files or Information
+//   - T1204.002: User Execution - Malicious File
+//
+// THREAT CONTEXT:
+//   PowerShell transcription logs record all PowerShell activity including
+//   commands and output. Operational logs provide metadata about PowerShell
+//   execution. This query attempts multiple field extraction paths to handle
+//   variations in how MDE captures this data.
+//
+// DATA SOURCE:
+//   - DeviceEvents (PowerShell transcription, operational logs, script content)
+//   - Requires: Microsoft Defender for Endpoint with PowerShell telemetry
+//
+// CONFIGURATION:
+//   IMPORTANT: Customize the parameters below for your investigation
+//
+// PERFORMANCE NOTES:
+//   - Estimated execution time: 20-30 seconds for 14 days of data
+//   - Efficient filtering on device and process names
+//   - Multiple coalesce operations for field extraction
+//
+// LAST UPDATED: 2026-01-19
+// VERSION: 2.0
+// ============================================================================
+
+// ============================================================================
+// CONFIGURATION PARAMETERS - CUSTOMIZE FOR YOUR INVESTIGATION
+// ============================================================================
+let deviceName = "workstation1";  // Target device hostname
+let fileName = "malicious.ps1";   // Target script filename or keyword to search
+let timeRange = ago(14d);          // Lookback period for deleted files
+
+// ============================================================================
+// MAIN QUERY LOGIC
+// ============================================================================
+
+// PowerShell Transcription and Operational Logs Recovery
+DeviceEvents
+| where Timestamp > timeRange
+| where DeviceName =~ deviceName
+// Filter to PowerShell-related action types
+| where ActionType in (
+    "PowerShellCommand",        // Script block logging (Event ID 4104)
+    "ScriptContent",            // Alternative script content event
+    "ProcessCreated",           // Process creation events
+    "TranscriptionLogged",      // Transcription events (when enabled)
+    "OperationalEventLogged"    // PowerShell operational log events
+)
+// Filter to PowerShell processes
+| where InitiatingProcessFileName in~ ("powershell.exe", "pwsh.exe")
+    or FileName in~ ("powershell.exe", "pwsh.exe")
+// ============================================================================
+// EXTRACT CONTENT FROM MULTIPLE FIELD PATHS
+// ============================================================================
+// Parse AdditionalFields JSON structure
+| extend Fields = parse_json(AdditionalFields)
+// Try multiple field paths for content extraction
+// Different MDE versions and configurations store data differently
+| extend
+    Content1 = tostring(Fields.ScriptBlockText),     // Primary: Script block text
+    Content2 = tostring(Fields.Payload),              // Alternative: Payload field
+    Content3 = tostring(Fields.Command),              // Alternative: Command field
+    Content4 = tostring(Fields.ScriptContent),        // Alternative: ScriptContent field
+    Content5 = tostring(Fields.TranscriptContent),    // Transcription content
+    HostApplication = tostring(Fields.HostApplication),
+    ScriptName = tostring(Fields.ScriptName),
+    Path = tostring(Fields.Path)
+// Combine all content fields using coalesce (first non-empty value)
+| extend
+    CombinedContent = coalesce(Content1, Content2, Content3, Content4, Content5, ""),
+    // Extract possible file references from various fields and command lines
+    PossibleFile = coalesce(
+        ScriptName,
+        Path,
+        extract(@"([^\\\/]+\.ps1)", 1, ProcessCommandLine),
+        extract(@"([^\\\/]+\.ps1)", 1, InitiatingProcessCommandLine)
+    )
+// ============================================================================
+// FILTER TO RELEVANT CONTENT
+// ============================================================================
+// Include events that match our search criteria
+| where CombinedContent contains "malicious"
+    or CombinedContent contains fileName
+    or PossibleFile contains "malicious"
+    or PossibleFile contains fileName
+    or ProcessCommandLine contains fileName
+// ============================================================================
+// ENRICH WITH ANALYSIS METADATA
+// ============================================================================
+| extend
+    ContentLength = strlen(CombinedContent),
+    HasSubstantialContent = iff(strlen(CombinedContent) > 50, true, false),
+    ContentQuality = case(
+        strlen(CombinedContent) > 500, "High - Full Script",
+        strlen(CombinedContent) > 100, "Medium - Partial Content",
+        strlen(CombinedContent) > 10, "Low - Fragment",
+        "Minimal - Metadata Only"
+    ),
+    // Detect suspicious patterns in content
+    HasEncodedContent = iff(CombinedContent matches regex @"(?i)-enc|base64|convert", true, false),
+    HasDownloadCommand = iff(CombinedContent matches regex @"(?i)downloadstring|downloadfile|invoke-webrequest|wget|curl", true, false),
+    HasObfuscation = iff(CombinedContent matches regex @"\^|`|\+\s*'|\$\(|iex|invoke-expression", true, false),
+    // Risk scoring
+    RiskScore = case(
+        CombinedContent matches regex @"(?i)mimikatz|invoke-mimikatz|dumpcreds", "Critical",
+        CombinedContent matches regex @"(?i)downloadstring|invoke-webrequest.*iex", "High",
+        CombinedContent matches regex @"(?i)bypass|noprofile|hidden", "Medium",
+        "Low"
+    )
+// ============================================================================
+// OUTPUT RESULTS
+// ============================================================================
+| project
+    Timestamp,
+    EventSource = ActionType,
+    ContentQuality,
+    ScriptFile = PossibleFile,
+    RecoveredContent = CombinedContent,
+    ContentLength,
+    HasEncodedContent,
+    HasDownloadCommand,
+    HasObfuscation,
+    RiskScore,
+    HostApplication,
+    ProcessCommandLine,
+    InitiatingProcessCommandLine,
+    InitiatingProcessAccountName,
+    InitiatingProcessFolderPath,
+    DeviceName,
+    // Keep all original content fields for deep analysis if needed
+    AllFields = Fields
+| sort by Timestamp asc
+
+// ============================================================================
+// TROUBLESHOOTING
+// ============================================================================
+// - If no results: Check if PowerShell logging is enabled
+// - If ContentQuality = "Minimal": May need to enable transcription logging
+// - If missing expected content: Try extending timeRange or checking different device
+//
+// ENABLE REQUIRED LOGGING:
+// 1. PowerShell Transcription (GPO):
+//    Computer Configuration > Administrative Templates > Windows Components >
+//    Windows PowerShell > Turn on PowerShell Transcription
+//    Path: Computer Configuration > Administrative Templates > Windows Components > Windows PowerShell
+// 2. PowerShell Script Block Logging (GPO):
+//    Turn on PowerShell Script Block Logging
+// 3. Via PowerShell commands:
+//    # Enable transcription
+//    Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\Transcription" -Name EnableTranscripting -Value 1
+//    # Enable script block logging
+//    Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging" -Name EnableScriptBlockLogging -Value 1
+//
+// CONTENT QUALITY INTERPRETATION:
+// - "High - Full Script": Complete script recovered (>500 chars)
+//   * Action: Analyze for IOCs, commands, and malicious patterns
+// - "Medium - Partial Content": Partial script recovered (100-500 chars)
+//   * Action: May need to correlate with other events
+// - "Low - Fragment": Small fragment recovered (10-100 chars)
+//   * Action: Useful for keywords but may need additional context
+// - "Minimal - Metadata Only": Only metadata recovered (<10 chars)
+//   * Action: Use for timeline correlation only
+//
+// EXAMPLE INVESTIGATION WORKFLOWS:
+// 1. Identify malicious script:
+//    - Filter by RiskScore = "Critical" or "High"
+//    - Review RecoveredContent for suspicious commands
+// 2. Reconstruct attack timeline:
+//    - Sort by Timestamp to see sequence of PowerShell activity
+//    - Look for HostApplication changes (may indicate different attack stages)
+// 3. Find related activities:
+//    - Use InitiatingProcessAccountName to find other activities by same user
+//    - Use ProcessCommandLine patterns to find similar executions
+//
+// FOLLOW-UP QUERIES:
+// - Get all PowerShell activity from the same user account:
+//   DeviceEvents
+//   | where DeviceName == "<device>"
+//   | where InitiatingProcessAccountName == "<account_from_results>"
+//   | where InitiatingProcessFileName in~ ("powershell.exe", "pwsh.exe")
+//   | where Timestamp between (datetime(<start>) .. datetime(<end>))
+// - Check for file operations related to recovered script:
+//   DeviceFileEvents
+//   | where DeviceName == "<device>"
+//   | where FolderPath contains "<script_path_from_results>"
+// - Look for network activity from PowerShell:
+//   DeviceNetworkEvents
+//   | where DeviceName == "<device>"
+//   | where InitiatingProcessFileName in~ ("powershell.exe", "pwsh.exe")
+//   | where Timestamp between (datetime(<first_seen>) .. datetime(<last_seen>))
+//   | project Timestamp, RemoteIP, RemoteUrl, InitiatingProcessCommandLine
+//
+// RISK INDICATORS TO ANALYZE:
+// - HasEncodedContent = true: May indicate obfuscation or evasion
+// - HasDownloadCommand = true: Potential malware download or staging
+// - HasObfuscation = true: Common in malicious scripts to evade detection
+// - RiskScore = "Critical"/"High": Immediate investigation required
+//
+// COMMON MALICIOUS PATTERNS TO SEARCH IN RecoveredContent:
+// - Download cradles: "IEX (New-Object Net.WebClient).DownloadString"
+// - Bypass execution policy: "-ExecutionPolicy Bypass"
+// - Hidden execution: "-WindowStyle Hidden"
+// - Encoded commands: "-EncodedCommand"
+// - Credential theft: "mimikatz", "Invoke-Mimikatz", "Get-Credential"
+// - Persistence: "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+// - Fileless: "Invoke-Expression", "IEX", reflection, memory injection

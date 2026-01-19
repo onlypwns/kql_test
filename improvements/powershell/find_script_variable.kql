@@ -1,0 +1,166 @@
+// ============================================================================
+// QUERY: PowerShell Variable Assignment and Command Recovery
+// ============================================================================
+//
+// PURPOSE:
+//   Recovers PowerShell variable assignments and command usage from script
+//   block logging. Useful for recovering file paths, credentials, or other
+//   data stored in variables during PowerShell execution.
+//
+// MITRE ATT&CK:
+//   - T1059.001: Command and Scripting Interpreter - PowerShell
+//   - T1070.004: Indicator Removal on Host - File Deletion (via Unblock-File)
+//   - T1027: Obfuscated Files or Information
+//
+// THREAT CONTEXT:
+//   Adversaries often use PowerShell variables to store paths, credentials,
+//   or data during script execution. The Unblock-File command is frequently
+//   used to bypass Windows security warnings on downloaded scripts. This
+//   query recovers these variable assignments and commands from script
+//   block logging.
+//
+// DATA SOURCE:
+//   - DeviceEvents (PowerShell script block logging)
+//   - Requires: Microsoft Defender for Endpoint + PowerShell script block logging
+//
+// CONFIGURATION:
+//   IMPORTANT: Customize the variables below for your investigation
+//
+// PERFORMANCE NOTES:
+//   - Estimated execution time: < 10 seconds for 1 hour of data
+//   - Very efficient with specific filters
+//   - Extend timeRange if searching for older activity
+//
+// LAST UPDATED: 2026-01-19
+// VERSION: 2.0
+// ============================================================================
+
+// ============================================================================
+// CONFIGURATION PARAMETERS - CUSTOMIZE FOR YOUR INVESTIGATION
+// ============================================================================
+let deviceName = "workstation1";  // Target device hostname
+let timeRange = ago(1h);           // Lookback period (adjust as needed)
+let targetVariable = "$path";      // Variable name to search for (e.g., "$path", "$cred", "$url")
+
+// ============================================================================
+// MAIN QUERY LOGIC
+// ============================================================================
+
+// Look for script blocks containing variable assignments and specific commands
+DeviceEvents
+| where Timestamp > timeRange
+| where DeviceName =~ deviceName
+// Filter to PowerShell script block logging events
+| where ActionType == "PowerShellCommand"
+// Extract script block content from AdditionalFields
+| extend ScriptContent = tostring(parse_json(AdditionalFields).ScriptBlockText)
+// Filter to scripts containing the target variable or variable assignment patterns
+| where ScriptContent contains targetVariable
+    or ScriptContent matches regex @"\$\w+\s*=.*"  // Generic variable assignment pattern
+// ============================================================================
+// EXTRACT VARIABLE ASSIGNMENTS AND COMMANDS
+// ============================================================================
+| extend
+    // Extract the specific variable assignment (e.g., $path = "C:\file.txt")
+    VariableAssignment = extract(
+        strcat(@'(', targetVariable, @'\s*=\s*["\']?[^"\'\r\n]+)'),
+        1,
+        ScriptContent
+    ),
+    // Extract any Unblock-File commands (commonly used to bypass security warnings)
+    UnblockCommand = extract(@'(Unblock-File[^;\r\n]+)', 1, ScriptContent),
+    // Extract Download-File or Invoke-WebRequest commands (common for malware staging)
+    DownloadCommand = extract(@'(Invoke-WebRequest[^;\r\n]+|wget[^;\r\n]+|curl[^;\r\n]+|DownloadFile[^;\r\n]+)', 1, ScriptContent),
+    // Extract any credential-related operations
+    CredentialOperation = extract(@'(Get-Credential[^;\r\n]+|ConvertTo-SecureString[^;\r\n]+|PSCredential[^;\r\n]+)', 1, ScriptContent),
+    // Extract all variable assignments for broader context
+    AllVariableAssignments = extract_all(@'(\$\w+\s*=\s*["\']?[^"\'\r\n;]+)', ScriptContent)
+// Filter to rows where we found interesting content
+| where isnotempty(VariableAssignment)
+    or isnotempty(UnblockCommand)
+    or isnotempty(DownloadCommand)
+    or isnotempty(CredentialOperation)
+// ============================================================================
+// ENRICH WITH CONTEXT
+// ============================================================================
+| extend
+    HasSuspiciousCommand = iff(
+        isnotempty(UnblockCommand) or isnotempty(DownloadCommand),
+        true,
+        false
+    ),
+    RiskIndicator = case(
+        isnotempty(CredentialOperation), "Credential Manipulation Detected",
+        isnotempty(DownloadCommand), "Download Command Detected",
+        isnotempty(UnblockCommand), "File Unblock Detected",
+        "Variable Assignment"
+    ),
+    Severity = case(
+        isnotempty(CredentialOperation), "High",
+        isnotempty(DownloadCommand), "High",
+        isnotempty(UnblockCommand), "Medium",
+        "Low"
+    )
+// ============================================================================
+// OUTPUT
+// ============================================================================
+| project
+    Timestamp,
+    DeviceName,
+    VariableAssignment,
+    UnblockCommand,
+    DownloadCommand,
+    CredentialOperation,
+    AllVariableAssignments,
+    RiskIndicator,
+    Severity,
+    ScriptContent,
+    InitiatingProcessAccountName,
+    InitiatingProcessCommandLine
+| sort by Timestamp asc
+
+// ============================================================================
+// TROUBLESHOOTING
+// ============================================================================
+// - If no results: Check if PowerShell script block logging is enabled
+// - If too many results: Narrow timeRange or filter by specific variable names
+// - If missing expected content: Script block logging may be incomplete for very long scripts
+//
+// ENABLE SCRIPT BLOCK LOGGING:
+// Via Group Policy:
+//   Computer Configuration > Administrative Templates > Windows Components >
+//   Windows PowerShell > Turn on PowerShell Script Block Logging
+// Via PowerShell:
+//   Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging" -Name EnableScriptBlockLogging -Value 1
+//
+// EXAMPLE INVESTIGATION WORKFLOWS:
+// 1. Find file paths stored in variables:
+//    - Look for VariableAssignment containing file extensions (.ps1, .exe, .dll)
+// 2. Identify malware staging:
+//    - Look for DownloadCommand combined with Unblock-File
+// 3. Detect credential theft:
+//    - Look for CredentialOperation combined with file writes or network activity
+//
+// FOLLOW-UP QUERIES:
+// - Check if downloaded file was executed:
+//   DeviceProcessEvents
+//   | where DeviceName == "<device>"
+//   | where Timestamp > datetime(<download_time>)
+//   | where ProcessCommandLine contains "<file_from_variable>"
+// - Check for file operations on the path:
+//   DeviceFileEvents
+//   | where DeviceName == "<device>"
+//   | where FolderPath contains "<path_from_variable>"
+// - Find all commands in the same script block:
+//   DeviceEvents
+//   | where DeviceName == "<device>"
+//   | where ActionType == "PowerShellCommand"
+//   | extend ScriptBlockId = tostring(parse_json(AdditionalFields).ScriptBlockId)
+//   | where ScriptBlockId == "<script_block_id_from_results>"
+//
+// COMMON VARIABLE NAMES TO SEARCH:
+// - $path, $file, $filepath -> File/path references
+// - $url, $uri, $link -> Network/download URLs
+// - $cred, $credential, $password -> Credentials
+// - $payload, $data, $command -> Malicious code
+// - $key, $secret, $token -> Authentication material

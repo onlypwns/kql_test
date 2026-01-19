@@ -1,0 +1,426 @@
+// ============================================================================
+// QUERY: Comprehensive LNK File Forensic Hunt (Multi-Table Union)
+// ============================================================================
+//
+// PURPOSE:
+//   Performs comprehensive forensic investigation of malicious LNK (shortcut)
+//   files by correlating evidence across multiple telemetry sources. Tracks
+//   file operations, process execution, registry changes, network connections,
+//   and security events to build a complete attack timeline.
+//
+// MITRE ATT&CK:
+//   - T1204.002: User Execution - Malicious File
+//   - T1547.009: Boot or Logon Autostart Execution - Shortcut Modification
+//   - T1566.001: Phishing - Spearphishing Attachment
+//   - T1027: Obfuscated Files or Information
+//   - T1105: Ingress Tool Transfer
+//
+// THREAT CONTEXT:
+//   Malicious LNK files are commonly used in phishing campaigns and initial
+//   access attacks. When executed, they can run hidden commands, download
+//   additional payloads, establish persistence, or execute malicious scripts.
+//   This query provides comprehensive visibility into LNK file-related activity
+//   across the attack lifecycle.
+//
+// DATA SOURCES:
+//   - DeviceFileEvents (File creation, modification, deletion)
+//   - DeviceProcessEvents (Process execution from LNK)
+//   - DeviceRegistryEvents (Persistence mechanisms)
+//   - DeviceNetworkEvents (C2 or download activity)
+//   - DeviceEvents (Security events, PowerShell, WMI)
+//   - DeviceImageLoadEvents (DLL loading)
+//   - Requires: Microsoft Defender for Endpoint or equivalent MDE telemetry
+//
+// CONFIGURATION:
+//   IMPORTANT: Replace the default values below with your investigation targets
+//
+// PERFORMANCE NOTES:
+//   - Estimated execution time: 60-90 seconds for 7 days of data
+//   - Uses union to combine 6 different event tables
+//   - Resource-intensive; reduce timeRange for faster results
+//   - Consider running during off-peak hours for historical analysis
+//
+// LAST UPDATED: 2026-01-19
+// VERSION: 2.0
+// ============================================================================
+
+// ============================================================================
+// CONFIGURATION PARAMETERS - CUSTOMIZE FOR YOUR INVESTIGATION
+// ============================================================================
+let deviceName = "workstation1";  // Target device hostname
+let fileName = "malicious.lnk";   // Target LNK file name or pattern
+let timeRange = ago(7d);           // Lookback period (adjust as needed)
+
+// ============================================================================
+// MAIN QUERY LOGIC - MULTI-SOURCE UNION HUNT
+// ============================================================================
+
+union
+// ============================================================================
+// Source 1: File Events (Creation, Modification, Deletion)
+// ============================================================================
+// Tracks the lifecycle of the LNK file itself
+(DeviceFileEvents
+| where Timestamp > timeRange
+| where DeviceName =~ deviceName
+| where FileName =~ fileName or FolderPath contains fileName
+| extend
+    EventType = "FileEvent",
+    ActionDetails = strcat(
+        "Action: ", ActionType,
+        " | Path: ", FolderPath,
+        " | SHA256: ", SHA256,
+        " | Size: ", FileSize, " bytes"
+    ),
+    ThreatIndicator = case(
+        ActionType == "FileDeleted", "File Deletion (Possible Evidence Removal)",
+        ActionType == "FileCreated" and InitiatingProcessFileName in~ ("outlook.exe", "chrome.exe", "msedge.exe"), "File Created from Email/Browser (Phishing Vector)",
+        "File Operation"
+    )
+| project
+    Timestamp,
+    DeviceName,
+    EventType,
+    ActionType,
+    FileName,
+    FolderPath,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    InitiatingProcessAccountName,
+    ActionDetails,
+    ThreatIndicator,
+    SHA256,
+    FileSize
+),
+// ============================================================================
+// Source 2: Process Events (Execution and Child Processes)
+// ============================================================================
+// Captures processes spawned by or related to the LNK file
+// LNK files typically execute via explorer.exe or cmd.exe
+(DeviceProcessEvents
+| where Timestamp > timeRange
+| where DeviceName =~ deviceName
+// Match processes where command line references the LNK file
+| where ProcessCommandLine contains fileName
+    or InitiatingProcessCommandLine contains fileName
+    // Common interpreters used by malicious LNK files
+    or (FileName in~ ("cmd.exe", "powershell.exe", "wscript.exe", "cscript.exe", "mshta.exe")
+        and ProcessCommandLine contains ".lnk")
+// Additional check: processes spawned shortly after LNK in file events
+| where ProcessCommandLine contains ".lnk" or InitiatingProcessCommandLine contains fileName
+| extend
+    EventType = "ProcessEvent",
+    ActionDetails = strcat(
+        "Process: ", FileName,
+        " | PID: ", ProcessId,
+        " | Parent: ", InitiatingProcessFileName,
+        " | User: ", AccountName
+    ),
+    ThreatIndicator = case(
+        ProcessCommandLine matches regex @"(?i)(powershell.*-enc|cmd.*/c|wscript|mshta)", "Suspicious Interpreter Usage",
+        ProcessCommandLine contains "http" or ProcessCommandLine contains "download", "Potential Download Command",
+        "Process Execution"
+    )
+| project
+    Timestamp,
+    DeviceName,
+    EventType,
+    ActionType = "ProcessCreated",
+    FileName,
+    FolderPath,
+    ProcessId,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    ProcessCommandLine,
+    InitiatingProcessAccountName,
+    ActionDetails,
+    ThreatIndicator,
+    SHA256
+),
+// ============================================================================
+// Source 3: Registry Events (Persistence Mechanisms)
+// ============================================================================
+// Detects persistence via registry modifications
+// Malicious LNK files often create registry Run keys or scheduled tasks
+(DeviceRegistryEvents
+| where Timestamp > timeRange
+| where DeviceName =~ deviceName
+// Match registry operations from LNK-related processes or containing LNK path
+| where InitiatingProcessCommandLine contains fileName
+    or (InitiatingProcessFileName in~ ("cmd.exe", "powershell.exe", "wscript.exe", "cscript.exe")
+        and Timestamp > timeRange)  // Within our investigation timeframe
+    or RegistryValueData contains fileName
+| extend
+    EventType = "RegistryEvent",
+    ActionDetails = strcat(
+        "Registry Action: ", ActionType,
+        " | Key: ", RegistryKey,
+        " | Value: ", RegistryValueName,
+        " | Data: ", RegistryValueData
+    ),
+    ThreatIndicator = case(
+        RegistryKey contains "\\Run" or RegistryKey contains "\\RunOnce", "Persistence via Run Key",
+        RegistryKey contains "\\Services" or RegistryKey contains "\\Windows\\CurrentVersion", "Potential Service/Startup Persistence",
+        "Registry Modification"
+    )
+| project
+    Timestamp,
+    DeviceName,
+    EventType,
+    ActionType,
+    FileName = InitiatingProcessFileName,
+    FolderPath = "",
+    RegistryKey,
+    RegistryValueName,
+    RegistryValueData,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    InitiatingProcessAccountName,
+    ActionDetails,
+    ThreatIndicator
+),
+// ============================================================================
+// Source 4: Network Events (C2 Communication or Downloads)
+// ============================================================================
+// Identifies network connections from LNK-related processes
+// Critical for detecting command & control or payload downloads
+(DeviceNetworkEvents
+| where Timestamp > timeRange
+| where DeviceName =~ deviceName
+// Match network activity from common LNK-spawned processes
+| where InitiatingProcessCommandLine contains fileName
+    or (InitiatingProcessFileName in~ ("rundll32.exe", "cmd.exe", "powershell.exe", "mshta.exe", "wscript.exe", "cscript.exe")
+        and Timestamp > timeRange)
+| extend
+    EventType = "NetworkEvent",
+    ActionDetails = strcat(
+        "Connection: ", RemoteIP, ":", RemotePort,
+        " | Protocol: ", Protocol,
+        " | URL: ", RemoteUrl,
+        " | Bytes Sent: ", BytesSent,
+        " | Bytes Received: ", BytesReceived
+    ),
+    ThreatIndicator = case(
+        RemotePort in (4444, 8080, 443, 80) and Protocol == "Tcp", "Potential C2 Connection",
+        isnotempty(RemoteUrl) and RemoteUrl matches regex @"(?i)\.(exe|dll|zip|ps1|vbs)$", "Executable Download Detected",
+        BytesReceived > 1000000, "Large Data Transfer (Potential Payload Download)",
+        "Network Connection"
+    )
+| project
+    Timestamp,
+    DeviceName,
+    EventType,
+    ActionType = "NetworkConnection",
+    FileName = InitiatingProcessFileName,
+    FolderPath = "",
+    RemoteIP,
+    RemotePort,
+    RemoteUrl,
+    Protocol,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    InitiatingProcessAccountName,
+    ActionDetails,
+    ThreatIndicator,
+    BytesSent,
+    BytesReceived
+),
+// ============================================================================
+// Source 5: Security/Misc Events (PowerShell, WMI, Scheduled Tasks)
+// ============================================================================
+// Captures additional suspicious activities
+// PowerShell execution, WMI operations, scheduled task creation
+(DeviceEvents
+| where Timestamp > timeRange
+| where DeviceName =~ deviceName
+// Match LNK-related security events
+| where InitiatingProcessCommandLine contains fileName
+    or (ActionType in ("PowerShellCommand", "ScriptContent", "WmiOperation", "ScheduledTaskCreated", "ScheduledTaskUpdated")
+        and Timestamp > timeRange)
+| extend
+    EventType = "SecurityEvent",
+    ActionDetails = strcat(
+        "Event: ", ActionType,
+        " | Process: ", InitiatingProcessFileName,
+        " | Additional: ", AdditionalFields
+    ),
+    ThreatIndicator = case(
+        ActionType == "PowerShellCommand", "PowerShell Execution (Possible Payload)",
+        ActionType contains "ScheduledTask", "Scheduled Task Persistence",
+        ActionType == "WmiOperation", "WMI Execution (Potential Evasion)",
+        "Security Event"
+    )
+| project
+    Timestamp,
+    DeviceName,
+    EventType,
+    ActionType,
+    FileName = InitiatingProcessFileName,
+    FolderPath = "",
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    InitiatingProcessAccountName,
+    ActionDetails,
+    ThreatIndicator,
+    AdditionalFields
+),
+// ============================================================================
+// Source 6: Image/DLL Load Events (Module Loading)
+// ============================================================================
+// Tracks DLLs loaded by LNK-related processes
+// Can reveal malicious DLL injection or payload execution
+(DeviceImageLoadEvents
+| where Timestamp > timeRange
+| where DeviceName =~ deviceName
+// Match DLL loads from LNK-related processes or suspicious DLL names
+| where InitiatingProcessCommandLine contains fileName
+    or FileName contains "malicious"
+    or (InitiatingProcessFileName in~ ("cmd.exe", "powershell.exe", "rundll32.exe")
+        and Timestamp > timeRange)
+| extend
+    EventType = "ImageLoadEvent",
+    ActionDetails = strcat(
+        "Loaded DLL: ", FileName,
+        " | Path: ", FolderPath,
+        " | SHA256: ", SHA256
+    ),
+    ThreatIndicator = case(
+        FolderPath contains "\\Temp\\" or FolderPath contains "\\AppData\\", "DLL Loaded from Suspicious Location",
+        FileName matches regex @"(?i)^[a-z0-9]{8,16}\.dll$", "Randomly Named DLL (Possible Malware)",
+        "DLL Load Event"
+    )
+| project
+    Timestamp,
+    DeviceName,
+    EventType,
+    ActionType = "ImageLoaded",
+    FileName,
+    FolderPath,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    InitiatingProcessAccountName,
+    ActionDetails,
+    ThreatIndicator,
+    SHA256
+)
+// ============================================================================
+// POST-PROCESSING: TIMELINE AND ANALYSIS
+// ============================================================================
+// Sort by timestamp to create chronological attack timeline
+| sort by Timestamp asc
+// Add sequential numbering for timeline visualization
+| extend EventNumber = row_number()
+// Calculate time between events (helps identify attack phases)
+| extend TimeSinceLastEvent = datetime_diff('second', Timestamp, prev(Timestamp))
+// Final output projection
+| project
+    EventNumber,
+    Timestamp,
+    TimeSinceLastEvent,
+    DeviceName,
+    EventType,
+    ActionType,
+    FileName,
+    FolderPath,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    InitiatingProcessAccountName,
+    ActionDetails,
+    ThreatIndicator
+
+// ============================================================================
+// TROUBLESHOOTING
+// ============================================================================
+// - If no results: Check deviceName and fileName are correct
+// - If partial results: Some event sources may not have data (check MDE configuration)
+// - If query times out: Reduce timeRange (e.g., ago(3d))
+// - If missing network events: Check if network event monitoring is enabled in MDE
+//
+// VALIDATE MDE DATA COLLECTION:
+// - File events: DeviceFileEvents | where Timestamp > ago(1h) | count
+// - Process events: DeviceProcessEvents | where Timestamp > ago(1h) | count
+// - Network events: DeviceNetworkEvents | where Timestamp > ago(1h) | count
+//
+// EXAMPLE INVESTIGATION WORKFLOWS:
+// 1. Initial triage:
+//    - Find first event (EventNumber = 1) to understand how LNK arrived
+//    - Look for ThreatIndicator containing "Phishing Vector"
+// 2. Execution analysis:
+//    - Focus on EventType = "ProcessEvent"
+//    - Review ProcessCommandLine for malicious commands
+// 3. Persistence check:
+//    - Filter EventType = "RegistryEvent"
+//    - Look for Run keys, scheduled tasks, or services
+// 4. C2 identification:
+//    - Filter EventType = "NetworkEvent"
+//    - Review RemoteIP, RemoteUrl for IOCs
+// 5. Payload analysis:
+//    - Filter EventType = "ImageLoadEvent"
+//    - Check for suspicious DLLs or executables
+//
+// FOLLOW-UP QUERIES:
+// - Find all LNK files on the device:
+//   DeviceFileEvents
+//   | where DeviceName == "<device>"
+//   | where FileName endswith ".lnk"
+//   | summarize Count = count() by FileName, FolderPath, SHA256
+//
+// - Check if LNK spread to other devices:
+//   DeviceFileEvents
+//   | where FileName == "<lnk_filename>"
+//   | where SHA256 == "<sha256_from_results>"
+//   | summarize Devices = make_set(DeviceName), FirstSeen = min(Timestamp)
+//
+// - Identify related files downloaded:
+//   DeviceFileEvents
+//   | where DeviceName == "<device>"
+//   | where Timestamp between (datetime(<first_event>) .. datetime(<last_event>))
+//   | where ActionType == "FileCreated"
+//   | where FileName endswith ".exe" or FileName endswith ".dll" or FileName endswith ".ps1"
+//   | project Timestamp, FileName, FolderPath, SHA256
+//
+// - Get full PowerShell execution context:
+//   DeviceEvents
+//   | where DeviceName == "<device>"
+//   | where ActionType == "PowerShellCommand"
+//   | where Timestamp between (datetime(<first_event>) .. datetime(<last_event>))
+//   | extend ScriptBlock = parse_json(AdditionalFields).ScriptBlockText
+//   | project Timestamp, ScriptBlock
+//
+// RESPONSE ACTIONS:
+// 1. **IMMEDIATE**:
+//    - Isolate affected device from network
+//    - Kill any running malicious processes
+//    - Disable user account if compromised
+// 2. **EVIDENCE COLLECTION**:
+//    - Export complete timeline from this query
+//    - Collect LNK file for analysis (if still present)
+//    - Capture memory dump if advanced analysis needed
+//    - Save all SHA256 hashes for IOC sharing
+// 3. **REMEDIATION**:
+//    - Remove LNK file and all downloaded payloads
+//    - Remove persistence mechanisms (Run keys, scheduled tasks)
+//    - Scan with updated antivirus/EDR
+//    - Rebuild system if rootkit suspected
+// 4. **PREVENTION**:
+//    - Block LNK file hashes across organization
+//    - Update email filtering rules
+//    - User training on phishing recognition
+//    - Deploy ASR rules to block LNK execution from email/webmail
+//
+// MALICIOUS LNK FILE INDICATORS:
+// - LNK target points to cmd.exe, powershell.exe, or mshta.exe
+// - Hidden or obfuscated command line arguments
+// - LNK created/modified by email client or browser
+// - LNK downloads additional files from internet
+// - LNK establishes network connections
+// - LNK creates registry Run keys or scheduled tasks
+// - LNK executes encoded PowerShell commands
+// - LNK loads DLLs from temp directories
+//
+// COMMON MALICIOUS LNK PATTERNS:
+// - Emotet/TrickBot: LNK -> PowerShell -> Download DLL
+// - Hancitor: LNK -> CMD -> MSHTA -> Payload
+// - Qakbot: LNK -> CMD -> Regsvr32 -> Malicious DLL
+// - IcedID: LNK -> WScript -> Download and Execute
+// - BazarLoader: LNK -> PowerShell -> Encoded Command -> C2

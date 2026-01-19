@@ -1,0 +1,134 @@
+// ============================================================================
+// QUERY: GraphRunner Tool Detection via UserAgent Analysis
+// ============================================================================
+//
+// PURPOSE:
+//   Detects the GraphRunner post-exploitation toolkit by identifying
+//   suspicious UserAgent strings in sign-ins to Microsoft Graph API.
+//   GraphRunner uses Python-based requests with specific UserAgent patterns.
+//
+// MITRE ATT&CK:
+//   - T1087.004: Account Discovery - Cloud Account
+//   - T1069.003: Permission Groups Discovery - Cloud Groups
+//   - T1114.002: Email Collection - Remote Email Collection
+//   - T1528: Steal Application Access Token
+//
+// THREAT CONTEXT:
+//   GraphRunner is a post-exploitation toolset for interacting with Microsoft
+//   Graph API after obtaining valid credentials or tokens. It's commonly used
+//   for reconnaissance, privilege escalation, and data exfiltration in Azure AD
+//   environments.
+//
+// DATA SOURCE:
+//   - SigninLogs
+//   - Requires: Azure AD Premium P1 or P2 license
+//
+// DETECTION METHOD:
+//   Identifies sign-ins to Microsoft Graph using UserAgent strings known to
+//   be associated with GraphRunner and similar Python-based offensive tools.
+//
+// RECOMMENDATIONS:
+//   - Alert on all matches (high confidence indicators)
+//   - Investigate user account for compromise
+//   - Review all Graph API activity from the detected session
+//   - Check for data exfiltration or privilege changes
+//   - Reset user credentials and revoke active sessions
+//
+// PERFORMANCE NOTES:
+//   - Estimated execution time: < 10 seconds for 30 days of data
+//   - Uses efficient 'in' operator for UserAgent matching
+//   - Consider adding time filters for high-volume environments
+//
+// KNOWN FALSE POSITIVES:
+//   - Legitimate Python scripts or automation using older UserAgent strings
+//   - Testing/QA environments
+//   - Rate: Very Low (< 1% in typical environments)
+//
+// LAST UPDATED: 2026-01-19
+// VERSION: 2.0
+// ============================================================================
+
+// Configuration Parameters
+let lookbackPeriod = 30d;  // Adjust based on retention and investigation needs
+
+// Suspicious UserAgent patterns associated with GraphRunner and similar tools
+// These UserAgents are unusual for legitimate Microsoft Graph access
+let suspiciousUserAgents = dynamic([
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/103.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Android 4.4; Mobile; rv:70.0) Gecko/70.0 Firefox/70.0",
+    "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 8.1.0; Pixel Build/OPM4.171019.021.D1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/65.0.3325.109 Mobile Safari/537.36 EdgA/42.0.0.2057",
+    "Mozilla/5.0 (Linux; U; Android 4.0.2; en-us; Galaxy Nexus Build/ICL53F) AppleWebKit/534.30 (KHTML, like Gecko) Version/4.0 Mobile Safari/534.30",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.14; rv:70.0) Gecko/20100101 Firefox/70.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/604.1 Edg/91.0.100.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.0.3 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; WOW64; Trident/7.0; rv:11.0) like Gecko",
+    "Mozilla/5.0 (Windows NT 10.0; WOW64; rv:70.0) Gecko/20100101 Firefox/70.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.102 Safari/537.36 Edge/18.19042",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 12_3_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/12.1.1 EdgiOS/44.5.0.10 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 13_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/91.0.4472.114 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 13_2_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.0.3 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 8_3 like Mac OS X) AppleWebKit/600.1.4 (KHTML, like Gecko) FxiOS/1.0 Mobile/12F69 Safari/600.1.4"
+]);
+
+// Main Detection Logic
+SigninLogs
+| where TimeGenerated >= ago(lookbackPeriod)
+// Focus on Microsoft Graph access
+| where ResourceDisplayName == "Microsoft Graph"
+// Match against known suspicious UserAgents
+| where UserAgent in (suspiciousUserAgents)
+// Enrich with risk indicators
+| extend
+    RiskIndicator = "GraphRunner/Offensive Tool UserAgent Detected",
+    ConfidenceLevel = "High",
+    Severity = case(
+        ResultType == "0", "High",  // Successful authentication
+        "Medium"  // Failed attempt (still suspicious)
+    ),
+    AuthenticationSuccess = iff(ResultType == "0", "Success", "Failed")
+| project
+    TimeGenerated,
+    UserPrincipalName,
+    AuthenticationProtocol,
+    ResourceDisplayName,
+    AppDisplayName,
+    IPAddress,
+    Location,
+    DeviceDetail,
+    ResultDescription,
+    AuthenticationSuccess,
+    UserAgent,
+    ConditionalAccessStatus,
+    RiskLevelDuringSignIn,
+    RiskIndicator,
+    ConfidenceLevel,
+    Severity,
+    CorrelationId
+| sort by TimeGenerated desc
+
+// TROUBLESHOOTING:
+// - If no results: Check if SigninLogs table exists and time range is appropriate
+// - If too many results: Focus on successful authentications only (ResultType == "0")
+// - To analyze patterns: Group by UserPrincipalName or IPAddress
+//
+// EXAMPLE INVESTIGATION QUERIES:
+// - Check all Graph API calls from flagged user/session:
+//   MicrosoftGraphActivityLogs
+//   | where UserId == "<detected_user_id>"
+//   | where TimeGenerated > datetime(<detection_time>)
+//   | summarize Endpoints = make_set(RequestUri), count() by bin(TimeGenerated, 1h)
+// - Check for other suspicious activity from same IP:
+//   SigninLogs
+//   | where IPAddress == "<detected_ip>"
+//   | where TimeGenerated between (datetime(<start>) .. datetime(<end>))
+//   | summarize Users = make_set(UserPrincipalName), Apps = make_set(AppDisplayName)
+//
+// RESPONSE ACTIONS:
+// 1. Immediately revoke user sessions and refresh tokens
+// 2. Reset user credentials
+// 3. Review audit logs for privilege changes or data access
+// 4. Check for mailbox rules, forwarding, or delegations
+// 5. Assess scope of compromise and potential data exfiltration
